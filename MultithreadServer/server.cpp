@@ -17,6 +17,12 @@
 #include "protocol_handler.h"
 #include "utility.h"
 
+// Older macOS SDKs have no MSG_NOSIGNAL; SIGPIPE is ignored anyway and
+// sockets get SO_NOSIGPIPE where available
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 Server* g_server = nullptr;
 
 namespace {
