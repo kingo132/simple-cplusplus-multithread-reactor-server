@@ -58,6 +58,8 @@ struct Connection {
     uint32_t flags = 0;
     const BindInfo* bind = nullptr;  // bind entry (listening sockets and accepted clients)
     uint32_t interest = 0;      // events currently registered in the dispatcher
+    bool registered = false;    // fd is in the dispatcher (removed while there is no interest,
+                                // otherwise HUP/ERR would be reported over and over)
     ByteBuffer recv_buffer;     // received, not yet framed bytes
     ByteBuffer send_buffer;     // queued, not yet sent bytes
     size_t pending_package = 0; // length reported by handle_input_* that is not complete yet

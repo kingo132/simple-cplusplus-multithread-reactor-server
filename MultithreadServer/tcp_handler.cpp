@@ -137,6 +137,10 @@ void TcpHandler::split_packages(Server& server, Connection* conn) {
 }
 
 void TcpHandler::handle_eof(Server& server, Connection* conn) {
+    if (conn->flags & CN_EOF) {
+        server.update_interest(conn); // already reported
+        return;
+    }
     conn->flags |= CN_EOF;
     if (conn->is_outbound() && (conn->flags & CN_HALF_CLOSE)) {
         server.deliver(conn->info.worker_id, BlockType::ServerEof, conn->info, nullptr, 0);

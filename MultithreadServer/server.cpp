@@ -347,7 +347,8 @@ bool Server::watch(Connection* conn) {
         events = EV_WRITE;
     }
     conn->interest = events;
-    return dispatcher_->add_fd(conn->info.sock_fd, events);
+    conn->registered = dispatcher_->add_fd(conn->info.sock_fd, events);
+    return conn->registered;
 }
 
 void Server::update_interest(Connection* conn) {
@@ -363,6 +364,21 @@ void Server::update_interest(Connection* conn) {
         if (!conn->send_buffer.empty()) {
             desired |= EV_WRITE;
         }
+    }
+    if (desired == 0) {
+        // Nothing to wait for: leave the dispatcher, error / hang up events
+        // would otherwise wake us up continuously
+        if (conn->registered) {
+            dispatcher_->remove_fd(conn->info.sock_fd);
+            conn->registered = false;
+        }
+        conn->interest = 0;
+        return;
+    }
+    if (!conn->registered) {
+        conn->registered = dispatcher_->add_fd(conn->info.sock_fd, desired);
+        conn->interest = desired;
+        return;
     }
     if (desired != conn->interest) {
         conn->interest = desired;
