@@ -11,6 +11,7 @@ mkdir -p "$WORK"
 SANITIZE="${SANITIZE:-}"
 PORT_ECHO=${PORT_ECHO:-22345}
 PORT_RELAY=${PORT_RELAY:-22346}
+PORT_UDP_UPSTREAM=${PORT_UDP_UPSTREAM:-22347}
 FAILED=0
 
 log() { echo -e "\033[1;34m==> $*\033[0m"; }
@@ -50,6 +51,7 @@ event_engine = $engine
 test_mode = $mode
 relay_target_ip = 127.0.0.1
 relay_target_port = $PORT_ECHO
+relay_udp_target_port = $PORT_UDP_UPSTREAM
 CONF
     "$ROOT/MultithreadServer/mulserver" "$dir/conf/config.ini" > "$dir/stdout.txt" 2>&1 &
     echo $! > "$dir/pid"
@@ -90,6 +92,8 @@ for engine in epoll poll; do
         start_server relay "$PORT_RELAY" relay "$engine"
         run_client -p "$PORT_RELAY" -c 20 -n 200 -s 8192
         run_client -p "$PORT_RELAY" -c 10 -n 50 -s 65536 -w 16
+        echo "  empty upstream datagram"
+        python3 "$ROOT/tests/udp_empty_test.py" "$PORT_RELAY" "$PORT_UDP_UPSTREAM" || fail "empty upstream datagram"
         stop_server relay
     fi
     stop_server "echo-$engine"

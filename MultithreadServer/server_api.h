@@ -152,7 +152,8 @@ SRV_EXPORT int handle_client_close(const SocketInfo* si);
 SRV_EXPORT int handle_input_from_server(const char* data, int len, const SocketInfo* si);
 
 /* [WORK thread] One package from an outbound connection. With
- * SRV_CONNECT_HALF_CLOSE, data == NULL && len == 0 signals peer EOF.
+ * SRV_CONNECT_HALF_CLOSE, data == NULL && len == 0 signals peer EOF; an
+ * empty datagram arrives as len == 0 with a non-NULL data.
  * Return <0 to close the connection. */
 SRV_EXPORT int handle_message_from_server(const char* data, int len, const SocketInfo* si);
 
