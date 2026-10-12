@@ -6,7 +6,10 @@
 // test_mode = relay : every TCP client gets an outbound connection to
 //                     relay_target_ip:relay_target_port and bytes are relayed
 //                     transparently in both directions (exercises srv_connect,
-//                     half close and flow control)
+//                     half close and flow control); every UDP client
+//                     datagram goes out on its own datagram socket to
+//                     relay_udp_target_port, replies are sent back and an
+//                     empty reply is reported as an empty package
 #include <arpa/inet.h>
 #include <cstring>
 #include <string>
@@ -20,6 +23,7 @@ namespace {
 enum class Mode { Echo, Relay };
 Mode g_mode = Mode::Echo;
 NetAddr g_relay_target;
+NetAddr g_relay_udp_target;
 
 // Per worker state: client conn_id -> relay pair
 struct RelayPair {
@@ -30,6 +34,7 @@ struct RelayPair {
 };
 thread_local std::unordered_map<uint64_t, RelayPair>* t_pairs = nullptr;
 thread_local uint64_t t_messages = 0;
+thread_local uint64_t t_next_dgram_tag = 1ull << 63; // keys of UDP pairs, never a conn_id
 
 } // namespace
 
@@ -42,7 +47,9 @@ int handle_init(int /*argc*/, char** /*argv*/, int thread_type) {
         if (g_mode == Mode::Relay) {
             const char* ip = srv_conf_string("relay_target_ip", "127.0.0.1");
             int port = srv_conf_int("relay_target_port", 12345);
-            if (srv_addr_from_string(ip, static_cast<uint16_t>(port), &g_relay_target) != 0) {
+            int udp_port = srv_conf_int("relay_udp_target_port", port);
+            if (srv_addr_from_string(ip, static_cast<uint16_t>(port), &g_relay_target) != 0 ||
+                srv_addr_from_string(ip, static_cast<uint16_t>(udp_port), &g_relay_udp_target) != 0) {
                 LOG_ERR("Invalid relay target %s:%d", ip, port);
                 return -1;
             }
@@ -109,6 +116,18 @@ int handle_message_from_client(const char* data, int len, char** send_data, int*
         srv_send(&it->second.upstream, data, len);
         return 0;
     }
+    if (g_mode == Mode::Relay && si->conn_kind == SRV_CONN_UDP_CLIENT) {
+        uint64_t tag = t_next_dgram_tag++;
+        RelayPair pair;
+        pair.client = *si;
+        pair.client_closed = true; // nothing to close on the client side
+        if (srv_connect(SOCK_DGRAM, 0, &g_relay_udp_target, SRV_CONNECT_RAW, tag, &pair.upstream) != 0) {
+            return 0;
+        }
+        srv_send(&pair.upstream, data, len);
+        (*t_pairs)[tag] = pair;
+        return 0;
+    }
     LOG_TRACE("handle_process, len: %d", len);
     std::memcpy(*send_data, data, static_cast<size_t>(len));
     *send_len = len;
@@ -147,12 +166,26 @@ int handle_message_from_server(const char* data, int len, const SocketInfo* si) 
     if (it == t_pairs->end()) {
         return -1;
     }
+    bool udp = it->second.client.conn_kind == SRV_CONN_UDP_CLIENT;
     if (data == nullptr && len == 0) {
+        if (udp) {
+            LOG_ERR("Datagram upstream reported EOF");
+            return -1;
+        }
         // Upstream half closed: forward the FIN to the client
         srv_shutdown_write(&it->second.client);
         return 0;
     }
+    if (len == 0) {
+        // Empty datagram: report it as a package without payload
+        uint32_t empty[2] = {htonl(8), 0};
+        srv_send(&it->second.client, empty, sizeof(empty));
+        return 0;
+    }
     srv_send(&it->second.client, data, len);
+    if (udp) {
+        srv_close(&it->second.upstream); // the echo is the last reply
+    }
     return 0;
 }
 
