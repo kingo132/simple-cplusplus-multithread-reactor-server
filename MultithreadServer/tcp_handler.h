@@ -3,11 +3,17 @@
 
 #include "protocol_handler.h"
 
+// Stream sockets: accept, framing with handle_input_*, buffered writes
 class TcpHandler : public ProtocolHandler {
 public:
-    void accept_client(int server_fd, ClientManager& client_manager, EventDispatcher* dispatcher, dll_func_t* dll_functions, size_t recv_buffer_size, size_t send_buffer_size) override;
-    ssize_t receive_data(ClientInfo& client, dll_func_t* dll_functions, RingQueue& recv_queue) override;
-    ssize_t send_data(ClientInfo& client, const char* buffer, size_t length) override;
+    void accept_client(Server& server, Connection* listener) override;
+    void receive_data(Server& server, Connection* conn) override;
+    void send_pending(Server& server, Connection* conn) override;
+    void send_data(Server& server, Connection* conn, const char* buffer, size_t length, const NetAddr* to) override;
+
+private:
+    void split_packages(Server& server, Connection* conn);
+    void handle_eof(Server& server, Connection* conn);
 };
 
 #endif // TCP_HANDLER_H

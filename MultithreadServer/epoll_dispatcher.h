@@ -1,21 +1,21 @@
-#ifdef __linux__
 #ifndef EPOLL_DISPATCHER_H
 #define EPOLL_DISPATCHER_H
 
-#include "event_dispatcher.h"
+#ifdef __linux__
 #include <sys/epoll.h>
-#include <unistd.h>
-#include <iostream>
-#include <functional>
+
+#include "event_dispatcher.h"
 
 class EpollDispatcher : public EventDispatcher {
 public:
     EpollDispatcher();
-    ~EpollDispatcher();
+    ~EpollDispatcher() override;
 
-    void add_fd(int fd) override;
+    bool add_fd(int fd, uint32_t events) override;
+    bool modify_fd(int fd, uint32_t events) override;
     void remove_fd(int fd) override;
-    void wait_and_handle_events(int timeout_milliseconds, const std::function<void(int fd, bool is_readable)>& handler) override;
+    int wait_and_handle_events(int timeout_milliseconds, const Handler& handler) override;
+    const char* name() const override { return "epoll"; }
 
 private:
     int epoll_fd_;
@@ -23,5 +23,5 @@ private:
     epoll_event events_[MAX_EVENTS];
 };
 
-#endif // EPOLL_DISPATCHER_H
 #endif // __linux__
+#endif // EPOLL_DISPATCHER_H

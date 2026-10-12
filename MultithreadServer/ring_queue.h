@@ -2,55 +2,96 @@
 #define RING_QUEUE_H
 
 #include <atomic>
-#include <mutex>
-#include <condition_variable>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
+#include <vector>
 
-#include "socket_info.h"
+#include "server_api.h"
 
-// Enumeration of block types
-enum class BlockType : char {
-    Data,    // Data block
-    Padding, // Padding block for alignment
-    Final    // End of message block, indicating connection closure
+// Types of the blocks travelling through the ring queues
+enum class BlockType : uint32_t {
+    Padding = 0,      // filler at the end of the buffer, skipped by readers
+
+    // network thread -> worker thread
+    ClientOpen,       // TCP client accepted
+    ClientData,       // package from a client
+    ClientClose,      // client connection closed
+    ServerOpen,       // outbound connect finished (arg = errno, 0 = ok)
+    ServerData,       // package from an outbound connection
+    ServerEof,        // outbound peer sent FIN (SRV_CONNECT_HALF_CLOSE)
+    ServerClose,      // outbound connection closed
+    WriteBlocked,     // arg = 1 blocked, 0 drained
+
+    // worker thread -> network thread
+    Send,             // queue data to a connection
+    Close,            // close after flushing
+    Abort,            // close immediately
+    ShutdownWrite,    // shutdown(SHUT_WR) after flushing
+    PauseRead,        // arg = 1 pause, 0 resume
+    SetUserTag,       // arg64 = tag
+    Register          // register a socket created by srv_connect (arg = flags)
 };
 
-// Structure of a data block in the ring queue
+// Header of a block in the ring queue, the payload follows directly
 struct QueueBlock {
-    uint32_t total_length;      // Total length of the block, including header and data
-    uint64_t block_id;          // Block ID
-    BlockType type;             // Type of the data block
-    SocketInfo socket_info;     // Socket information associated with this block
-    uint16_t accept_fd;         // Socket accepting the client connection
-    char data[];                // Variable-length data part
+    uint32_t total_length;      // header + payload length (without alignment padding)
+    BlockType type;             // must stay in the first 8 bytes (padding marker)
+    uint64_t block_id;          // sequence number, for tracing
+    int32_t arg;                // type specific argument
+    uint32_t reserved;
+    uint64_t arg64;             // type specific argument
+    SocketInfo socket_info;     // connection this block belongs to
+
+    size_t payload_length() const { return total_length - sizeof(QueueBlock); }
 };
 
+// Bounded multi-producer / multi-consumer queue of variable sized blocks.
+// Blocks are stored contiguously: when a block does not fit before the end
+// of the buffer, a padding block fills the rest and the block is written at
+// the beginning.
 class RingQueue {
 public:
-    RingQueue(size_t buffer_size);  // buffer_size represents the total size of the queue
+    explicit RingQueue(size_t buffer_size); // buffer_size: total size of the queue in bytes
     ~RingQueue();
 
-    // Push a data block into the queue
-    bool push(const char* data, size_t length, const QueueBlock& block_header);
-    // Pop a data block from the queue, returns the actual data length
-    bool wait_and_pop(char* data, size_t max_buffer_size, size_t& actual_length, QueueBlock& block_header, std::chrono::milliseconds timeout);
+    RingQueue(const RingQueue&) = delete;
+    RingQueue& operator=(const RingQueue&) = delete;
 
-    // Reserved functions: for future expansion of padding functionality
-    void enable_padding(bool enable);
-    void insert_padding_if_needed();
+    // Push a block without blocking; false if there is not enough room
+    bool try_push(QueueBlock& block_header, const void* data, size_t length);
+
+    // Push a block, waiting up to `timeout` for free space
+    bool push(QueueBlock& block_header, const void* data, size_t length, std::chrono::milliseconds timeout);
+
+    // Pop a block, waiting up to `timeout` for data. The payload is copied to `data`
+    bool wait_and_pop(QueueBlock& block_header, std::vector<char>& data, std::chrono::milliseconds timeout);
+    bool try_pop(QueueBlock& block_header, std::vector<char>& data);
+
+    // Wake all waiters (used on shutdown)
+    void notify_all();
+
+    // Whether a block with this payload length can ever fit into the queue
+    bool fits(size_t length) const;
+
+    size_t capacity() const { return buffer_size_; }
+    size_t used_space();
 
 private:
+    static size_t align(size_t n) { return (n + 7) & ~static_cast<size_t>(7); }
+    bool push_locked(QueueBlock& block_header, const void* data, size_t length);
+    bool pop_locked(QueueBlock& block_header, std::vector<char>& data);
+
     size_t buffer_size_;  // Total size of the ring queue
     char* buffer_;        // Continuous memory block
-    std::atomic<size_t> write_index_;
-    std::atomic<size_t> read_index_;
+    uint64_t write_index_; // monotonically increasing byte positions
+    uint64_t read_index_;
+    uint64_t next_block_id_;
     std::mutex mutex_;
-    std::condition_variable cond_var_;
-
-    bool padding_enabled_;  // Indicates if padding is enabled
-
-    size_t get_free_space() const;
-    size_t get_used_space() const;
+    std::condition_variable not_empty_;
+    std::condition_variable not_full_;
 };
 
 #endif // RING_QUEUE_H

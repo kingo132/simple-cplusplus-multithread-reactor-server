@@ -1,2 +1,3 @@
-#ip        #port        #type        #idle timeout
-127.0.0.1    12345        tcp        60
+#ip          #port        #type        #idle timeout (seconds, 0 = never)
+127.0.0.1    12345        tcp          60
+127.0.0.1    12345        udp          0
