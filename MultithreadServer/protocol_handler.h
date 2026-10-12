@@ -1,24 +1,31 @@
 #ifndef PROTOCOL_HANDLER_H
 #define PROTOCOL_HANDLER_H
 
-#include "client_manager.h"
-#include "event_dispatcher.h"
-#include "dll_functions.h"
-#include "log_manager.h"
-#include "ring_queue.h"
+#include <cstddef>
 
+#include "connection_manager.h"
+#include "server_api.h"
+
+class Server;
+
+// Socket I/O for one transport type. All methods run on the network thread.
 class ProtocolHandler {
 public:
     virtual ~ProtocolHandler() = default;
 
-    // Method to accept new clients
-    virtual void accept_client(int server_fd, ClientManager& client_manager, EventDispatcher* dispatcher, dll_func_t* dll_functions, size_t recv_buffer_size, size_t send_buffer_size) = 0;
+    // A listening / bound socket from the bind file is readable
+    virtual void accept_client(Server& server, Connection* listener) = 0;
 
-    // Method to receive data
-    virtual ssize_t receive_data(ClientInfo& client, dll_func_t* dll_functions, RingQueue& recv_queue) = 0;
+    // A connected socket is readable (or reported an error)
+    virtual void receive_data(Server& server, Connection* conn) = 0;
 
-    // Method to send data
-    virtual ssize_t send_data(ClientInfo& client, const char* buffer, size_t length) = 0;
+    // A connected socket is writable
+    virtual void send_pending(Server& server, Connection* conn) = 0;
+
+    // Send data queued by a worker. `to` is the destination for datagrams
+    // received on a bind socket, otherwise nullptr.
+    virtual void send_data(Server& server, Connection* conn, const char* buffer, size_t length,
+                           const NetAddr* to) = 0;
 
     // Static factory methods to get protocol handlers
     static ProtocolHandler* get_tcp_handler();

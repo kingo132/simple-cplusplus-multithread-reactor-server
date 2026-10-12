@@ -1,14 +1,12 @@
-CXX = g++
-CXXFLAGS = -std=c++11 -pthread -Wall
+CXX ?= g++
+CXXFLAGS ?= -O2
+override CXXFLAGS += -std=c++11 -pthread -Wall -Wextra
 TARGET = tcp_test_client
 
 all: $(TARGET)
 
-$(TARGET): main.o
-	$(CXX) $(CXXFLAGS) -o $(TARGET) main.o
-
-main.o: main.cpp
-	$(CXX) $(CXXFLAGS) -c main.cpp
+$(TARGET): main.cpp
+	$(CXX) $(CXXFLAGS) -o $(TARGET) main.cpp
 
 clean:
 	rm -f $(TARGET) *.o

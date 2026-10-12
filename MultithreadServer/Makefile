@@ -1,50 +1,49 @@
-# Compiler and flags
-CXX = g++
-CXXFLAGS = -std=c++11 -Wall -Wextra -O2
-LDFLAGS = -lpthread
+# Build the server engine (mulserver).
+#   make            release build
+#   make DEBUG=1    debug build with -O0 -g
+#   make SANITIZE=address|thread|undefined
+CXX ?= g++
+CXXFLAGS ?= -O2
+override CXXFLAGS += -std=c++11 -Wall -Wextra -g -pthread -DSRV_ENGINE_INTERNAL -I.
+override LDFLAGS += -pthread
 
-# Platform detection
 UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S), Linux)
+    override LDFLAGS += -ldl -rdynamic      # export srv_* symbols to the plugin
+else ifeq ($(UNAME_S), Darwin)
+    override LDFLAGS += -Wl,-export_dynamic
+endif
 
-# Source files
-SRCS = server.cpp log_manager.cpp client_manager.cpp ring_queue.cpp \
-       protocol_handler.cpp tcp_handler.cpp udp_handler.cpp configuration_manager.cpp \
-       daemon_manager.cpp dll_functions.cpp ring_queue.cpp select_dispatcher.cpp \
-       main.cpp
+ifeq ($(DEBUG), 1)
+    override CXXFLAGS += -O0
+endif
+ifneq ($(SANITIZE),)
+    override CXXFLAGS += -fsanitize=$(SANITIZE) -fno-omit-frame-pointer
+    override LDFLAGS += -fsanitize=$(SANITIZE)
+endif
 
-# Object files
+SRCS = main.cpp server.cpp server_api.cpp connection_manager.cpp ring_queue.cpp \
+       protocol_handler.cpp tcp_handler.cpp udp_handler.cpp \
+       event_dispatcher_factory.cpp poll_dispatcher.cpp epoll_dispatcher.cpp \
+       configuration_manager.cpp daemon_manager.cpp dll_functions.cpp log_manager.cpp utility.cpp
+
 OBJS = $(SRCS:.cpp=.o)
+DEPS = $(SRCS:.cpp=.d)
 
 # Target executable
 TARGET = mulserver
 
-# Platform-specific flags and sources
-ifeq ($(UNAME_S), Linux)
-    CXXFLAGS += -D__linux__
-    SRCS += epoll_dispatcher.cpp
-    LDFLAGS += -ldl   # For dynamically loading libraries in Linux
-else ifeq ($(UNAME_S), Darwin)
-    CXXFLAGS += -D__APPLE__
-    SRCS += select_dispatcher.cpp
-endif
-
-# Include directories
-INCLUDES = -I.
-
-# Default rule
 all: $(TARGET)
 
-# Rule to build the target
 $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-# Rule for compiling C++ source files
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
-# Clean rule
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(DEPS) $(TARGET)
 
-# Phony targets
+-include $(DEPS)
+
 .PHONY: all clean

@@ -1,154 +1,193 @@
 #include "tcp_handler.h"
 
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <netinet/in.h>
 
-#include "default_config.h"
+#include "server.h"
+#include "utility.h"
 
-// Handle new TCP client connection
-void TcpHandler::accept_client(int server_fd, ClientManager& client_manager, EventDispatcher* dispatcher, dll_func_t* dll_functions, size_t recv_buffer_size, size_t send_buffer_size) {
-    sockaddr_in client_addr{};
-    socklen_t client_len = sizeof(client_addr);
-    int client_fd = accept(server_fd, (sockaddr*)&client_addr, &client_len);
-
-    if (client_fd >= 0) {
-        // TODO: set client_fd to non block
-        
-        SocketInfo socket_info;
-        socket_info.sock_fd = client_fd;
-        socket_info.local_ip = ntohl(client_addr.sin_addr.s_addr);
-        socket_info.local_port = ntohs(client_addr.sin_port);
-
-        // Add client to ClientManager
-        ClientInfo* ci = client_manager.add_client(client_fd, socket_info, CN_VALID_MASK | CN_LISTEN_MASK, recv_buffer_size, send_buffer_size);
-
-        int send_len = (int) ci->send_len;
-        if (dll_functions->handle_client_open && dll_functions->handle_client_open(&ci->send_buffer, &(send_len), &ci->socket_info) < 0) {
-            LOG_TRACE("handle_client_open error, remove client.");
-            client_manager.remove_client(client_fd, dispatcher);
-            close(client_fd);
+// Handle new TCP client connections
+void TcpHandler::accept_client(Server& server, Connection* listener) {
+    const ServerOptions& options = server.options();
+    for (int i = 0; i < 256; ++i) {
+        sockaddr_storage client_addr{};
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(listener->info.sock_fd, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+        if (client_fd < 0) {
+            if (errno == EINTR || errno == ECONNABORTED) {
+                continue;
+            }
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                LOG_ERR("Failed to accept new TCP client on fd %d: %s", listener->info.sock_fd, strerror(errno));
+            }
             return;
         }
-        
-        // Add client fd to the event dispatcher
-        dispatcher->add_fd(client_fd);
 
-        LOG_INFO("Accepted new TCP client: %d", client_fd);
+        if (server.connections().size() >= static_cast<size_t>(options.max_connections)) {
+            LOG_WARN("Too many connections (%zu), reject new client", server.connections().size());
+            close(client_fd);
+            continue;
+        }
+
+        Utility::set_nonblocking(client_fd);
+        Utility::set_cloexec(client_fd);
+        if (options.tcp_nodelay) {
+            int on = 1;
+            setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+        }
+#ifdef SO_NOSIGPIPE
+        int on_nosig = 1;
+        setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &on_nosig, sizeof(on_nosig));
+#endif
+
+        Connection* conn = server.connections().add(client_fd);
+        SocketInfo& si = conn->info;
+        si.sock_fd = client_fd;
+        si.socket_type = SOCK_STREAM;
+        si.conn_kind = SRV_CONN_TCP_CLIENT;
+        si.listen_fd = listener->info.sock_fd;
+        si.worker_id = server.pick_worker_round_robin();
+        si.conn_id = server.next_conn_id();
+        si.create_timestamp = si.recv_timestamp = time(nullptr);
+        Utility::sockaddr_to_netaddr(reinterpret_cast<sockaddr*>(&client_addr), &si.remote_addr);
+        sockaddr_storage local_addr{};
+        socklen_t local_len = sizeof(local_addr);
+        if (getsockname(client_fd, reinterpret_cast<sockaddr*>(&local_addr), &local_len) == 0) {
+            Utility::sockaddr_to_netaddr(reinterpret_cast<sockaddr*>(&local_addr), &si.local_addr);
+        }
+        if (si.remote_addr.family == AF_INET) {
+            si.remote_ip = ntohl(*reinterpret_cast<const uint32_t*>(si.remote_addr.ip));
+            si.remote_port = si.remote_addr.port;
+            si.local_ip = ntohl(*reinterpret_cast<const uint32_t*>(si.local_addr.ip));
+            si.local_port = si.local_addr.port;
+        }
+        conn->bind = listener->bind;
+        conn->last_active_ms = Utility::now_ms();
+
+        if (!server.watch(conn)) {
+            close(client_fd);
+            server.connections().remove(client_fd);
+            continue;
+        }
+        conn->flags |= CN_OPEN_NOTIFIED;
+        server.deliver(si.worker_id, BlockType::ClientOpen, si, nullptr, 0);
+
+        LOG_DEBUG("Accepted new TCP client fd %d from %s, worker %d", client_fd,
+                  Utility::netaddr_to_string(si.remote_addr).c_str(), si.worker_id);
+    }
+}
+
+// Split the receive buffer into packages and hand them to the worker
+void TcpHandler::split_packages(Server& server, Connection* conn) {
+    const dll_func_t* dll = server.dll();
+    auto input = conn->is_outbound() ? dll->handle_input_from_server : dll->handle_input_from_client;
+    bool raw = (conn->flags & CN_RAW) || input == nullptr;
+    size_t max_packet = static_cast<size_t>(server.options().max_packet_size);
+
+    while (!conn->recv_buffer.empty()) {
+        size_t avail = conn->recv_buffer.size();
+        if (raw) {
+            size_t len = std::min(avail, max_packet);
+            server.dispatch_package(conn, conn->recv_buffer.data(), len);
+            conn->recv_buffer.consume(len);
+            continue;
+        }
+        if (conn->pending_package > avail) {
+            break; // the length is known, wait for the rest
+        }
+
+        int result = input(conn->recv_buffer.data(), static_cast<int>(std::min<size_t>(avail, 0x7fffffff)),
+                           &conn->info);
+        if (result < 0) {
+            LOG_WARN("Invalid package from fd %d (%s), close connection", conn->info.sock_fd,
+                     Utility::netaddr_to_string(conn->info.remote_addr).c_str());
+            server.close_connection(conn, EPROTO, true);
+            return;
+        }
+        if (result == 0) {
+            if (avail >= max_packet) {
+                LOG_ERR("No complete package within %zu bytes from fd %d, close connection", max_packet,
+                        conn->info.sock_fd);
+                server.close_connection(conn, EMSGSIZE, true);
+                return;
+            }
+            break;
+        }
+        if (static_cast<size_t>(result) > max_packet) {
+            LOG_ERR("Package of %d bytes from fd %d exceeds max_packet_size %zu, close connection", result,
+                    conn->info.sock_fd, max_packet);
+            server.close_connection(conn, EMSGSIZE, true);
+            return;
+        }
+        if (static_cast<size_t>(result) > avail) {
+            conn->pending_package = static_cast<size_t>(result);
+            break;
+        }
+
+        conn->pending_package = 0;
+        LOG_TRACE("Complete package of %d bytes from fd %d", result, conn->info.sock_fd);
+        server.dispatch_package(conn, conn->recv_buffer.data(), static_cast<size_t>(result));
+        conn->recv_buffer.consume(static_cast<size_t>(result));
+    }
+}
+
+void TcpHandler::handle_eof(Server& server, Connection* conn) {
+    if (conn->flags & CN_EOF) {
+        server.update_interest(conn); // already reported
+        return;
+    }
+    conn->flags |= CN_EOF;
+    if (conn->is_outbound() && (conn->flags & CN_HALF_CLOSE)) {
+        server.deliver(conn->info.worker_id, BlockType::ServerEof, conn->info, nullptr, 0);
+        server.update_interest(conn);
+        return;
+    }
+    LOG_DEBUG("Peer closed fd %d (%s)", conn->info.sock_fd, Utility::netaddr_to_string(conn->info.remote_addr).c_str());
+    if (conn->send_buffer.empty()) {
+        server.close_connection(conn, 0);
     } else {
-        LOG_ERR("Failed to accept new TCP client on server_fd: %d", server_fd);
+        conn->flags |= CN_CLOSING; // flush what is queued, then close
+        server.update_interest(conn);
     }
 }
 
 // Handle receiving TCP data
-ssize_t TcpHandler::receive_data(ClientInfo& client, dll_func_t* dll_functions, RingQueue& recv_queue) {
-    char buffer[DEFAULT_MAX_PACKET_SIZE];
-    
-    ssize_t bytes_received = recv(client.socket_info.sock_fd, buffer, DEFAULT_MAX_PACKET_SIZE, 0);
+void TcpHandler::receive_data(Server& server, Connection* conn) {
+    if (server.should_throttle(conn)) {
+        server.throttle(conn);
+        return;
+    }
+
+    size_t chunk = static_cast<size_t>(server.options().recv_chunk_size);
+    char* buffer = conn->recv_buffer.prepare(chunk);
+    ssize_t bytes_received = recv(conn->info.sock_fd, buffer, chunk, 0);
+    conn->recv_buffer.commit(bytes_received > 0 ? static_cast<size_t>(bytes_received) : 0, chunk);
 
     if (bytes_received > 0) {
-        LOG_TRACE("recv return len %d.", bytes_received);
-        if (client.recv_len + bytes_received > client.recv_buffer_size) {
-            LOG_ERR("Receive buffer overflow for client fd: %d", client.socket_info.sock_fd);
-            return -1;
-        }
-
-        std::memcpy(client.recv_buffer + client.recv_len, buffer, bytes_received);
-        client.recv_len += bytes_received;
-
-        // Process the accumulated data
-        int result;
-        while ((result = dll_functions->handle_input_from_client(client.recv_buffer, (int)client.recv_len, &client.socket_info)) > 0) {
-            // Handle complete packet
-            LOG_TRACE("Received complete packet size %d from TCP client fd: %d", result, client.socket_info.sock_fd);
-
-            // Push the complete packet to the queue
-            QueueBlock recv_block;
-            recv_block.accept_fd = client.socket_info.sock_fd;
-            recv_block.socket_info = client.socket_info;
-            recv_block.type = BlockType::Data;
-            recv_block.total_length = result + sizeof(QueueBlock);
-
-            recv_queue.push(client.recv_buffer, result, recv_block);
-
-            // Shift any remaining data in recv_buffer
-            size_t remaining_length = client.recv_len - result;
-            if (remaining_length > 0) {
-                std::memmove(client.recv_buffer, client.recv_buffer + result, remaining_length);
-            }
-            client.recv_len = remaining_length;
-            if (client.recv_len == 0) {
-                result = 0;
-                break;
-            }
-        }
-
-        // If `handle_input_from_client` returns 0, it means we're still waiting for more data.
-        if (result == 0) {
-            return 0;
-        } else {
-            // `handle_input_from_client` returned a negative value, indicating an error.
-            LOG_WARN("Closing TCP connection on fd: %d", client.socket_info.sock_fd);
-            return -1;
-        }
+        LOG_TRACE("recv %zd bytes from fd %d", bytes_received, conn->info.sock_fd);
+        conn->last_active_ms = Utility::now_ms();
+        conn->info.recv_timestamp = time(nullptr);
+        split_packages(server, conn);
     } else if (bytes_received == 0) {
-        LOG_INFO("TCP client closed connection: %d", client.socket_info.sock_fd);
-        return -1;
-    } else {
-        LOG_ERR("Error receiving data from TCP client fd: %d", client.socket_info.sock_fd);
-        return -1;
+        handle_eof(server, conn);
+    } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        int err = errno;
+        LOG_DEBUG("Error receiving data from fd %d: %s", conn->info.sock_fd, strerror(err));
+        server.close_connection(conn, err);
     }
+}
+
+// Socket became writable: flush the send buffer
+void TcpHandler::send_pending(Server& server, Connection* conn) {
+    server.flush_stream(conn);
 }
 
 // Handle sending TCP data
-ssize_t TcpHandler::send_data(ClientInfo& client, const char* buffer, size_t length) {
-    ssize_t bytes_sent;
-
-    // Step 1: If there is leftover data in send_buffer, append the new data to it
-    if (client.send_len > 0) {
-        if (client.send_len + length <= client.send_buffer_size) {
-            std::memcpy(client.send_buffer + client.send_len, buffer, length);
-            client.send_len += length;
-        } else {
-            LOG_ERR("Send buffer overflow for client fd: %d", client.socket_info.sock_fd);
-            return -1; // Buffer overflow
-        }
-
-        bytes_sent = send(client.socket_info.sock_fd, client.send_buffer, client.send_len, 0);
-    } else {
-        // No leftover data, send new data directly
-        bytes_sent = send(client.socket_info.sock_fd, buffer, length, 0);
-    }
-
-    // Step 2: Handle the result of the send operation
-    if (bytes_sent >= 0) {
-        LOG_TRACE("Sent %ld bytes to TCP client fd: %d", bytes_sent, client.socket_info.sock_fd);
-
-        // If we sent part of the send_buffer, shift remaining data
-        if (client.send_len > 0) {
-            if ((size_t)bytes_sent < client.send_len) {
-                size_t remaining_length = client.send_len - bytes_sent;
-                std::memmove(client.send_buffer, client.send_buffer + bytes_sent, remaining_length);
-                client.send_len = remaining_length;
-            } else {
-                client.send_len = 0;
-            }
-        } else if ((size_t)bytes_sent < length) {
-            // Not all data was sent, store the unsent part in send_buffer
-            size_t remaining_length = length - bytes_sent;
-            if (remaining_length <= client.send_buffer_size) {
-                std::memcpy(client.send_buffer, buffer + bytes_sent, remaining_length);
-                client.send_len = remaining_length;
-            } else {
-                LOG_ERR("Send buffer overflow for client fd: %d", client.socket_info.sock_fd);
-                return -1; // Buffer overflow
-            }
-        }
-    } else {
-        LOG_ERR("Failed to send data to TCP client fd: %d", client.socket_info.sock_fd);
-        return -1; // Error occurred while sending data
-    }
-
-    return bytes_sent;
+void TcpHandler::send_data(Server& server, Connection* conn, const char* buffer, size_t length, const NetAddr*) {
+    server.queue_stream_send(conn, buffer, length);
 }
-

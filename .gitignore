@@ -1,0 +1,11 @@
+*.o
+*.d
+*.so
+*.dylib
+MultithreadServer/mulserver
+TestClient/tcp_test_client
+log/
+build/
+build-*/
+.DS_Store
+xcuserdata/
