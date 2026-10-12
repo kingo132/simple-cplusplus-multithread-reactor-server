@@ -1,6 +1,6 @@
 CXX ?= g++
 CXXFLAGS ?= -O2
-CXXFLAGS += -std=c++11 -pthread -Wall -Wextra
+override CXXFLAGS += -std=c++11 -pthread -Wall -Wextra
 TARGET = tcp_test_client
 
 all: $(TARGET)

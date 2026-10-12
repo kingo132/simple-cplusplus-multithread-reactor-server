@@ -4,22 +4,22 @@
 #   make SANITIZE=address|thread|undefined
 CXX ?= g++
 CXXFLAGS ?= -O2
-CXXFLAGS += -std=c++11 -Wall -Wextra -g -pthread -DSRV_ENGINE_INTERNAL -I.
-LDFLAGS += -pthread
+override CXXFLAGS += -std=c++11 -Wall -Wextra -g -pthread -DSRV_ENGINE_INTERNAL -I.
+override LDFLAGS += -pthread
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S), Linux)
-    LDFLAGS += -ldl -rdynamic      # export srv_* symbols to the plugin
+    override LDFLAGS += -ldl -rdynamic      # export srv_* symbols to the plugin
 else ifeq ($(UNAME_S), Darwin)
-    LDFLAGS += -Wl,-export_dynamic
+    override LDFLAGS += -Wl,-export_dynamic
 endif
 
 ifeq ($(DEBUG), 1)
-    CXXFLAGS += -O0
+    override CXXFLAGS += -O0
 endif
 ifneq ($(SANITIZE),)
-    CXXFLAGS += -fsanitize=$(SANITIZE) -fno-omit-frame-pointer
-    LDFLAGS += -fsanitize=$(SANITIZE)
+    override CXXFLAGS += -fsanitize=$(SANITIZE) -fno-omit-frame-pointer
+    override LDFLAGS += -fsanitize=$(SANITIZE)
 endif
 
 SRCS = main.cpp server.cpp server_api.cpp connection_manager.cpp ring_queue.cpp \
