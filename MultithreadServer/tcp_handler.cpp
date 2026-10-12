@@ -154,7 +154,7 @@ void TcpHandler::handle_eof(Server& server, Connection* conn) {
 
 // Handle receiving TCP data
 void TcpHandler::receive_data(Server& server, Connection* conn) {
-    if (server.worker_overloaded(conn->info.worker_id)) {
+    if (server.should_throttle(conn)) {
         server.throttle(conn);
         return;
     }

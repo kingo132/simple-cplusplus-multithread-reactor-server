@@ -36,6 +36,7 @@ struct ServerOptions {
     size_t send_buffer_max = 0;
     size_t send_high_watermark = 0;
     size_t send_low_watermark = 0;
+    size_t outbound_queue_limit = 0;   // stop reading outbound connections above this worker queue fill
     bool drop_on_overflow = false;
     int listen_backlog = 0;
     int connect_timeout_ms = 0;
@@ -83,8 +84,12 @@ public:
     // queue is full they wait in a deferred list (in order).
     void deliver(int worker_id, BlockType type, const SocketInfo& si, const char* data, size_t len, int arg = 0);
 
-    // True if reading for this worker must pause because its queue is full
+    // True if reading for this worker must pause because its queue is full.
+    // Outbound connections are paused much earlier than clients, so that
+    // bulk data from servers never delays the (usually small) client
+    // messages queued behind it.
     bool worker_overloaded(int worker_id) const;
+    bool should_throttle(const Connection* conn);
     void throttle(Connection* conn);
 
     // Register a freshly accepted / created connection with the dispatcher

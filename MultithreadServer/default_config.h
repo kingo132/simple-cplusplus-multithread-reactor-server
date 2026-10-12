@@ -24,6 +24,8 @@ constexpr int DEFAULT_RECV_BUFFER_SIZE = 65536;             // recv_buffer: byte
 constexpr int DEFAULT_MAX_PACKET_SIZE = 65536;              // max_packet_size: largest package
 constexpr long long DEFAULT_SEND_BUFFER_MAX = 64LL << 20;   // send_buffer_max: unsent bytes per connection
 constexpr long long DEFAULT_SEND_HIGH_WATERMARK = 1 << 20;  // send_high_watermark: handle_write_blocked(1)
+constexpr long long DEFAULT_OUTBOUND_QUEUE_LIMIT = 1 << 20;  // outbound_queue_limit: pause reading servers above
+                                                            // this many bytes queued for their worker
 constexpr int DEFAULT_LISTEN_BACKLOG = 1024;                // listen_backlog
 constexpr int DEFAULT_CONNECT_TIMEOUT_MS = 10000;           // connect_timeout_ms
 constexpr bool DEFAULT_TCP_NODELAY = true;                  // tcp_nodelay

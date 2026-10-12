@@ -100,6 +100,10 @@ void UdpHandler::receive_data(Server& server, Connection* conn) {
             continue;
         }
         server.dispatch_package(conn, buffer.data(), static_cast<size_t>(n));
+        if (server.should_throttle(conn)) {
+            server.throttle(conn); // read the rest once the worker caught up
+            return;
+        }
     }
 }
 

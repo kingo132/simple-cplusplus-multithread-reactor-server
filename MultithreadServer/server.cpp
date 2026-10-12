@@ -129,6 +129,8 @@ void Server::load_options() {
     options_.send_high_watermark =
         static_cast<size_t>(cm.get_int64("send_high_watermark", DEFAULT_SEND_HIGH_WATERMARK));
     options_.send_low_watermark = options_.send_high_watermark / 4;
+    options_.outbound_queue_limit =
+        static_cast<size_t>(cm.get_int64("outbound_queue_limit", DEFAULT_OUTBOUND_QUEUE_LIMIT));
     options_.drop_on_overflow = cm.get_string("send_overflow_policy", DEFAULT_SEND_OVERFLOW_POLICY) == "drop";
     options_.listen_backlog = cm.get_integer("listen_backlog", DEFAULT_LISTEN_BACKLOG);
     options_.connect_timeout_ms = cm.get_integer("connect_timeout_ms", DEFAULT_CONNECT_TIMEOUT_MS);
@@ -402,6 +404,20 @@ bool Server::worker_overloaded(int worker_id) const {
     return deferred_bytes_[worker_id] > options_.recv_queue_size / 2;
 }
 
+bool Server::should_throttle(const Connection* conn) {
+    int worker = conn->info.worker_id;
+    if (worker < 0 || worker >= options_.num_workers) {
+        return false;
+    }
+    if (worker_overloaded(worker)) {
+        return true;
+    }
+    if (conn->is_outbound()) {
+        return !deferred_[worker].empty() || recv_queues_[worker]->used_space() > options_.outbound_queue_limit;
+    }
+    return false;
+}
+
 void Server::throttle(Connection* conn) {
     if (conn->flags & CN_THROTTLED) {
         return;
@@ -429,14 +445,22 @@ void Server::flush_deferred() {
             pending.pop_front();
         }
         if (!throttled_[w].empty() && !worker_overloaded(w)) {
+            bool outbound_ok =
+                pending.empty() && recv_queues_[w]->used_space() <= options_.outbound_queue_limit / 2;
+            std::vector<std::pair<int, uint64_t>> still_throttled;
             for (const auto& item : throttled_[w]) {
                 Connection* conn = connections_.get(item.first, item.second);
-                if (conn != nullptr) {
-                    conn->flags &= ~CN_THROTTLED;
-                    update_interest(conn);
+                if (conn == nullptr) {
+                    continue;
                 }
+                if (conn->is_outbound() && !outbound_ok) {
+                    still_throttled.push_back(item);
+                    continue;
+                }
+                conn->flags &= ~CN_THROTTLED;
+                update_interest(conn);
             }
-            throttled_[w].clear();
+            throttled_[w].swap(still_throttled);
         }
     }
 }
@@ -793,16 +817,17 @@ void Server::network_thread_func() {
 
     auto on_event = [this](int fd, uint32_t events) { handle_event(fd, events); };
     while (!stop_flag_.load(std::memory_order_acquire)) {
-        bool has_deferred = false;
-        for (const auto& pending : deferred_) {
-            if (!pending.empty()) {
-                has_deferred = true;
+        bool has_backlog = false;
+        for (int w = 0; w < options_.num_workers; ++w) {
+            if (!deferred_[w].empty() || !throttled_[w].empty()) {
+                has_backlog = true;
                 break;
             }
         }
 
-        // 1. Wait for network events (or a wakeup from a worker)
-        dispatcher_->wait_and_handle_events(has_deferred ? 2 : 100, on_event);
+        // 1. Wait for network events (or a wakeup from a worker). Poll quickly
+        //    while events wait for room in a worker queue.
+        dispatcher_->wait_and_handle_events(has_backlog ? 1 : 100, on_event);
 
         // 2. Execute commands queued by the workers (send, close, connect ...)
         process_commands();
