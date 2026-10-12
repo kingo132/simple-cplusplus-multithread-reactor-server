@@ -87,5 +87,6 @@ sequenceDiagram
 | 文件 | 测试内容 |
 |---|---|
 | `tests/ring_queue_test.cpp` | 带填充的回绕、队列满、多生产者多消费者、payload 完整性 |
-| `tests/run_tests.sh` | 编译所有内容，运行单元测试、echo（TCP + UDP）、relay、两种事件引擎，并检查 sanitizer 输出 |
+| `tests/run_tests.sh` | 编译所有内容，运行单元测试、echo（TCP + UDP）、relay（TCP + UDP）、两种事件引擎，并检查 sanitizer 输出 |
+| `tests/udp_empty_test.py` | 上游回复的空 UDP 数据报以空包（而不是 EOF）的形式到达客户端 |
 | `TestClient/main.cpp` | 负载生成器：N 个客户端，每个 M 条消息，校验每个回显的 payload |

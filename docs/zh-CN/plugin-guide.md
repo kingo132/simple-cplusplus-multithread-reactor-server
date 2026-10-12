@@ -177,6 +177,8 @@ sequenceDiagram
 * `SRV_CONNECT_RAW`：上游不做分包，每次读到的数据原样转发。
 * `SRV_CONNECT_HALF_CLOSE`：上游的 FIN 会变成 `handle_message_from_server(NULL, 0)`，这样就可以用
   `srv_shutdown_write()`（TCP 半关闭）把它转发出去，而不必把整条链路拆掉。
+  UDP 上游收到的空**数据报**则不同：它以 `len == 0` 但 `data` 指针非 NULL 的形式到达，
+  所以判断 EOF 时一定要检查 `data == NULL`。
 * `handle_write_blocked` + `srv_pause_read` 实现端到端的流量控制（参见
   [架构 § 13](architecture.md#13-背压)）。
 

@@ -87,5 +87,6 @@ sequenceDiagram
 | File | What it tests |
 |---|---|
 | `tests/ring_queue_test.cpp` | wrap-around with padding, full queue, many producers and consumers, payload integrity |
-| `tests/run_tests.sh` | builds everything, runs the unit test, echo (TCP + UDP), relay, both event engines, and checks sanitizer output |
+| `tests/run_tests.sh` | builds everything, runs the unit test, echo (TCP + UDP), relay (TCP + UDP), both event engines, and checks sanitizer output |
+| `tests/udp_empty_test.py` | an empty UDP reply from an upstream reaches the client as an empty package (not as EOF) |
 | `TestClient/main.cpp` | load generator: N clients, M messages, verifies every echoed payload |

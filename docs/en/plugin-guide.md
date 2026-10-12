@@ -184,6 +184,8 @@ Key techniques shown:
 * `SRV_CONNECT_RAW`: no framing for the upstream, every read is forwarded as is.
 * `SRV_CONNECT_HALF_CLOSE`: the upstream FIN becomes `handle_message_from_server(NULL, 0)` so it can
   be forwarded with `srv_shutdown_write()` (TCP half close) instead of tearing everything down.
+  An empty *datagram* on a UDP upstream is different: it arrives with `len == 0` but a non-NULL
+  `data` pointer, so always test `data == NULL` to detect EOF.
 * `handle_write_blocked` + `srv_pause_read` implement end-to-end flow control (see
   [Architecture § 13](architecture.md#13-back-pressure)).
 

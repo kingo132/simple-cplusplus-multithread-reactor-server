@@ -1084,7 +1084,9 @@ void Server::process_block(int /*worker_id*/, const QueueBlock& block, const std
                            std::vector<char>& send_buffer) {
     const SocketInfo* si = &block.socket_info;
     const dll_func_t* dll = dll_functions_;
-    const char* payload = data.empty() ? nullptr : data.data();
+    // Never NULL, even for an empty datagram: (NULL, 0) is reserved for ServerEof
+    static const char kEmptyPayload[1] = {0};
+    const char* payload = data.empty() ? kEmptyPayload : data.data();
     int payload_len = static_cast<int>(data.size());
 
     switch (block.type) {

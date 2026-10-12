@@ -423,7 +423,8 @@ sequenceDiagram
 * 回复从 bind socket 发往 `si->remote_addr`（由 `process_command` 传入 `to`）。
 * 当 worker 过载时，UDP 数据会被 **丢弃** 而不是缓冲 —— 这正是 UDP 的本性，也能保护服务器。
 * 对外的数据报 socket（`srv_connect(SOCK_DGRAM / SOCK_RAW)`）是用 `recv()` 读取的“已连接” socket；
-  每个数据报对应一个 `ServerData` 事件。
+  每个数据报对应一个 `ServerData` 事件。空数据报以 `len == 0` 且 `data` 非 NULL 的形式到达，
+  因此不会和半关闭的 EOF 信号 `(NULL, 0)` 混淆。
 
 ## 10. 对外连接（srv_connect）
 
@@ -726,7 +727,7 @@ flowchart TD
 | `ClientData` | `handle_message_from_client(data, len, &send, &send_len, si)` |
 | `ClientClose` | `handle_client_close(si)` |
 | `ServerOpen` | `handle_server_open(si, error)` |
-| `ServerData` | `handle_message_from_server(data, len, si)` |
+| `ServerData` | `handle_message_from_server(data, len, si)` —— 即使是空数据报，`data` 也不会是 NULL |
 | `ServerEof` | `handle_message_from_server(NULL, 0, si)` |
 | `ServerClose` | `handle_server_close(si)` |
 | `WriteBlocked` | `handle_write_blocked(si, blocked)` |

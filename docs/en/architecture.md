@@ -428,7 +428,8 @@ sequenceDiagram
 * When a worker is overloaded, UDP data is **dropped** instead of buffered — that is the nature of UDP
   and protects the server.
 * Outbound datagram sockets (`srv_connect(SOCK_DGRAM / SOCK_RAW)`) are "connected" sockets read with
-  `recv()`; each datagram is one `ServerData` event.
+  `recv()`; each datagram is one `ServerData` event. An empty datagram arrives as `len == 0` with a
+  non-NULL `data`, so it is never confused with the half-close EOF signal `(NULL, 0)`.
 
 ## 10. Outbound connections (srv_connect)
 
@@ -737,7 +738,7 @@ flowchart TD
 | `ClientData` | `handle_message_from_client(data, len, &send, &send_len, si)` |
 | `ClientClose` | `handle_client_close(si)` |
 | `ServerOpen` | `handle_server_open(si, error)` |
-| `ServerData` | `handle_message_from_server(data, len, si)` |
+| `ServerData` | `handle_message_from_server(data, len, si)` — `data` is never NULL, even for an empty datagram |
 | `ServerEof` | `handle_message_from_server(NULL, 0, si)` |
 | `ServerClose` | `handle_server_close(si)` |
 | `WriteBlocked` | `handle_write_blocked(si, blocked)` |

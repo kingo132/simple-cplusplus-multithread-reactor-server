@@ -128,7 +128,9 @@ void UdpHandler::accept_client(Server& server, Connection* listener) {
  * connect()ed, so recv() only returns datagrams from that peer. Each
  * datagram is delivered as ServerData (no handle_input_from_server call).
  * Note: n == 0 is an empty datagram, not EOF (datagram sockets have no
- * EOF); the plugin then sees handle_message_from_server(NULL, 0).
+ * EOF). It is delivered as a ServerData event without payload, and
+ * process_block() passes a non-NULL pointer with len 0, so the plugin can
+ * tell it apart from the half close EOF signal (NULL, 0).
  *
  * @param server the server
  * @param conn   the outbound datagram connection; it may be closed here
