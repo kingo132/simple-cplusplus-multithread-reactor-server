@@ -109,6 +109,7 @@ public:
     /**
      * Queue `len` bytes for the connection `si` (backs srv_send()).
      * Large stream payloads are split into chunks that fit the send queue.
+     * On a datagram socket len == 0 queues an empty datagram.
      * @return 0 if queued, -1 on invalid arguments or shutdown.
      */
     int api_send(const SocketInfo* si, const void* data, int len);

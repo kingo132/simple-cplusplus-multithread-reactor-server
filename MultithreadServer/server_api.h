@@ -191,8 +191,9 @@ SRV_EXPORT int srv_worker_count(void);
 SRV_EXPORT int srv_max_packet_size(void);
 
 /* Queue `len` bytes to the connection described by `si` (client or server,
- * for UDP clients the datagram goes to si->remote_addr). Returns 0 if
- * queued, -1 on error. */
+ * for UDP clients the datagram goes to si->remote_addr). On datagram
+ * sockets len == 0 sends an empty datagram (data may be NULL); on streams
+ * len must be > 0. Returns 0 if queued, -1 on error. */
 SRV_EXPORT int srv_send(const SocketInfo* si, const void* data, int len);
 
 /* Close after all queued data has been sent. */

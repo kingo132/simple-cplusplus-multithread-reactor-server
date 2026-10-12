@@ -236,7 +236,7 @@ network thread and executed in the order the calling thread issued them.
 
 | Function | Returns | Notes |
 |---|---|---|
-| `srv_send(si, data, len)` | 0 queued / -1 | TCP data larger than a quarter of the send queue is split (invisible to the peer). A datagram is never split |
+| `srv_send(si, data, len)` | 0 queued / -1 | TCP data larger than a quarter of the send queue is split (invisible to the peer). A datagram is never split; on a datagram socket `len == 0` sends an empty datagram |
 | `srv_close(si)` | 0 / -1 | close after all queued data was sent |
 | `srv_abort(si)` | 0 / -1 | discard queued data, TCP RST |
 | `srv_shutdown_write(si)` | 0 / -1 | half close after flushing |

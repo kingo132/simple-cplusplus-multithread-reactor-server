@@ -228,7 +228,7 @@ reactor_add_plugin(myplugin my_plugin.cpp)
 
 | 函数 | 返回值 | 说明 |
 |---|---|---|
-| `srv_send(si, data, len)` | 0 已入队 / -1 | 超过发送队列四分之一的 TCP 数据会被拆分（对端无感知）。数据报永远不会被拆分 |
+| `srv_send(si, data, len)` | 0 已入队 / -1 | 超过发送队列四分之一的 TCP 数据会被拆分（对端无感知）。数据报永远不会被拆分；在数据报 socket 上 `len == 0` 会发送一个空数据报 |
 | `srv_close(si)` | 0 / -1 | 所有排队的数据发完后关闭 |
 | `srv_abort(si)` | 0 / -1 | 丢弃排队的数据，TCP RST |
 | `srv_shutdown_write(si)` | 0 / -1 | flush 之后半关闭 |

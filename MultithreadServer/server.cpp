@@ -1256,12 +1256,18 @@ int Server::api_command(BlockType type, const SocketInfo* si, int arg, uint64_t 
  * Like api_command(Send) with a payload. Stream data larger than a
  * quarter of the queue is split into chunks (TCP is a byte stream, so the
  * split is invisible to the peer); a datagram cannot be split.
+ * An empty datagram (len == 0, data may be NULL) is a valid message and is
+ * queued as one Send block without payload; on a stream it would mean
+ * nothing, so it is rejected there.
  */
 int Server::api_send(const SocketInfo* si, const void* data, int len) {
-    if (si == nullptr || data == nullptr || len <= 0 || !send_queue_) {
+    if (si == nullptr || len < 0 || (len > 0 && data == nullptr) || !send_queue_) {
         return -1;
     }
     bool stream = si->socket_type == SOCK_STREAM;
+    if (len == 0 && stream) {
+        return -1;
+    }
     size_t max_chunk = send_queue_->capacity() / 4;
     if (!stream && static_cast<size_t>(len) > max_chunk) {
         LOG_ERR("Datagram of %d bytes is too large", len);
@@ -1270,7 +1276,8 @@ int Server::api_send(const SocketInfo* si, const void* data, int len) {
 
     const char* p = static_cast<const char*>(data);
     size_t remaining = static_cast<size_t>(len);
-    while (remaining > 0) {
+    // do/while: an empty datagram still needs its one (empty) Send block
+    do {
         size_t chunk = std::min(remaining, max_chunk);
         QueueBlock block{};
         block.type = BlockType::Send;
@@ -1290,7 +1297,7 @@ int Server::api_send(const SocketInfo* si, const void* data, int len) {
         }
         p += chunk;
         remaining -= chunk;
-    }
+    } while (remaining > 0);
     if (!t_is_network_thread) {
         wakeup_network();
     }
