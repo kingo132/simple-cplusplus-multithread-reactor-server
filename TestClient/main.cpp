@@ -1,9 +1,33 @@
-// Load / correctness test client for the reactor server test plugin.
-//
-// Every client thread sends packages [uint32 len][uint32 seq][random payload]
-// and verifies that exactly the same bytes come back.
-//
-//   tcp_test_client [-h host] [-p port] [-c clients] [-n messages] [-s max_size] [-u] [-w window]
+/**
+ * @file main.cpp
+ * @brief tcp_test_client: load and correctness test client for the test
+ *        plugin (TestHandler/dll_interface.cpp) in echo or relay mode.
+ *
+ * Starts `-c` client threads. Each opens its own TCP connection (or UDP
+ * socket with -u), sends `-n` packages in the plugin's format and checks
+ * that every reply is byte for byte identical to what was sent and arrives
+ * in order. The exit code is 0 only if every package came back correctly,
+ * which is what tests/run_tests.sh checks.
+ *
+ * Options (note: -h is the HOST, not help):
+ *   -h host     server address (default 127.0.0.1)
+ *   -p port     server port (default 12345)
+ *   -c clients  number of concurrent client threads / connections (20)
+ *   -n messages packages per client (200)
+ *   -s max_size largest package in bytes, header included (8192); sizes are
+ *               random between 8 and max_size
+ *   -w window   TCP only: packages sent before waiting for a reply (1).
+ *               > 1 tests pipelining: several packages arrive in one
+ *               recv() on the server and must be split correctly.
+ *   -u          use UDP (one datagram per package, 1 s reply timeout)
+ *
+ * Package format: [uint32 len][uint32 seq][random payload], len = total size.
+ * Usage:
+ *   tcp_test_client [-h host] [-p port] [-c clients] [-n messages] [-s max_size] [-u] [-w window]
+ *
+ * The client uses plain BLOCKING sockets and one thread per connection -
+ * the simplest possible design, deliberately different from the server.
+ */
 #include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
@@ -23,24 +47,32 @@
 
 namespace {
 
-std::string g_host = "127.0.0.1";
-int g_port = 12345;
-int g_clients = 20;
-int g_messages = 200;
-int g_max_size = 8192;
+// Settings from the command line (written before the threads start, then read only)
+std::string g_host = "127.0.0.1"; // -h
+int g_port = 12345;               // -p
+int g_clients = 20;               // -c: number of client threads
+int g_messages = 200;             // -n: packages per client
+int g_max_size = 8192;            // -s: largest package (bytes, header included)
 int g_window = 1;      // packages in flight per TCP client
-bool g_udp = false;
+bool g_udp = false;               // -u
 
-std::atomic<long long> g_ok{0};
-std::atomic<long long> g_fail{0};
-std::atomic<long long> g_bytes{0};
-std::mutex g_print_mutex;
+// Results, updated by all client threads (atomics: no lock needed)
+std::atomic<long long> g_ok{0};    // packages echoed correctly
+std::atomic<long long> g_fail{0};  // packages lost, wrong or never sent
+std::atomic<long long> g_bytes{0}; // bytes of correct replies
+std::mutex g_print_mutex;          // keeps lines of different threads from mixing
 
+/** Print one line to stdout, serialised between the threads. */
 void log_message(const std::string& message) {
     std::lock_guard<std::mutex> guard(g_print_mutex);
     std::cout << message << std::endl;
 }
 
+/**
+ * send() may write only part of the buffer (partial write), so loop until
+ * everything is sent. EINTR (interrupted by a signal) is simply retried.
+ * @return false on error.
+ */
 bool send_all(int fd, const char* data, size_t len) {
     while (len > 0) {
         ssize_t n = send(fd, data, len, 0);
@@ -56,6 +88,11 @@ bool send_all(int fd, const char* data, size_t len) {
     return true;
 }
 
+/**
+ * Read exactly `len` bytes. TCP has no message boundaries: one package may
+ * arrive in several pieces, so loop until it is complete.
+ * @return false on error or if the server closed the connection (recv() == 0).
+ */
 bool recv_all(int fd, char* data, size_t len) {
     while (len > 0) {
         ssize_t n = recv(fd, data, len, 0);
@@ -71,6 +108,14 @@ bool recv_all(int fd, char* data, size_t len) {
     return true;
 }
 
+/**
+ * Build one package: [uint32 total_length][uint32 seq][random payload],
+ * both header fields in network byte order (big endian).
+ * @param gen      per thread random generator
+ * @param seq      sequence number written into the header
+ * @param min_size smallest total size (8 = header only)
+ * @return the package, total size random in [min_size, g_max_size].
+ */
 std::vector<char> make_message(std::mt19937& gen, uint32_t seq, int min_size) {
     std::uniform_int_distribution<int> size_dist(min_size, g_max_size);
     std::uniform_int_distribution<int> byte_dist(0, 255);
@@ -86,6 +131,13 @@ std::vector<char> make_message(std::mt19937& gen, uint32_t seq, int min_size) {
     return msg;
 }
 
+/**
+ * Resolve g_host:g_port (IPv4 or IPv6, AF_UNSPEC) and connect a blocking
+ * socket. Only the first address returned is tried. For UDP, connect()
+ * just fixes the peer so send() / recv() can be used.
+ * @param type SOCK_STREAM or SOCK_DGRAM
+ * @return the socket fd, or -1 on failure.
+ */
 int connect_to_server(int type) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
@@ -103,6 +155,12 @@ int connect_to_server(int type) {
     return fd;
 }
 
+/**
+ * One TCP client thread. Keeps up to g_window packages in flight, then
+ * reads the reply to the oldest one. Replies must come back in order: the
+ * server processes all packages of one connection on the same worker.
+ * @param client_id index of the thread, used in messages and as random seed
+ */
 void tcp_client(int client_id) {
     int fd = connect_to_server(SOCK_STREAM);
     if (fd < 0) {
@@ -110,6 +168,7 @@ void tcp_client(int client_id) {
         g_fail += g_messages;
         return;
     }
+    // Send small packages immediately (no Nagle delay), lower latency per round trip
     int on = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
 
@@ -131,6 +190,7 @@ void tcp_client(int client_id) {
             ++sent;
         }
 
+        // The next reply must match the oldest package still in flight
         const std::vector<char>& expected = in_flight.front();
         std::vector<char> reply(expected.size());
         if (!recv_all(fd, reply.data(), reply.size())) {
@@ -154,6 +214,12 @@ void tcp_client(int client_id) {
     close(fd);
 }
 
+/**
+ * One UDP client thread: send a datagram, wait up to 1 s for the echo,
+ * compare. Strictly one datagram in flight. A lost datagram (the server
+ * drops datagrams when a worker is overloaded) counts as a failure.
+ * @param client_id index of the thread, used as random seed
+ */
 void udp_client(int client_id) {
     int fd = connect_to_server(SOCK_DGRAM);
     if (fd < 0) {
@@ -161,10 +227,11 @@ void udp_client(int client_id) {
         g_fail += g_messages;
         return;
     }
+    // Receive timeout: recv() fails after 1 s instead of waiting forever for a lost reply
     timeval tv{1, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     std::mt19937 gen(std::random_device{}() + static_cast<unsigned>(client_id));
-    std::vector<char> reply(70000);
+    std::vector<char> reply(70000); // larger than any UDP datagram, so nothing is truncated
     for (int i = 0; i < g_messages; ++i) {
         std::vector<char> msg = make_message(gen, static_cast<uint32_t>(i + 1), 8);
         if (send(fd, msg.data(), msg.size(), 0) < 0) {
@@ -182,6 +249,7 @@ void udp_client(int client_id) {
     close(fd);
 }
 
+/** Print the command line syntax. */
 void usage(const char* prog) {
     std::cout << "Usage: " << prog
               << " [-h host] [-p port] [-c clients] [-n messages] [-s max_size] [-w window] [-u]\n"
@@ -190,6 +258,10 @@ void usage(const char* prog) {
 
 } // namespace
 
+/**
+ * Parse the options, run all client threads, print a summary line.
+ * @return 0 if every package came back correctly, 1 otherwise.
+ */
 int main(int argc, char** argv) {
     int opt;
     while ((opt = getopt(argc, argv, "h:p:c:n:s:w:u?")) != -1) {
@@ -204,11 +276,13 @@ int main(int argc, char** argv) {
         default: usage(argv[0]); return 1;
         }
     }
+    // A package needs at least the 8 byte header
     if (g_max_size < 8) {
         g_max_size = 8;
     }
 
     auto start = std::chrono::steady_clock::now();
+    // One thread per simulated client, all running concurrently
     std::vector<std::thread> threads;
     for (int i = 0; i < g_clients; ++i) {
         threads.emplace_back(g_udp ? udp_client : tcp_client, i);

@@ -1,5 +1,22 @@
-// Unit test for RingQueue: wrap around with padding blocks, ordering and
-// concurrent producers / consumers.
+/**
+ * @file ring_queue_test.cpp
+ * @brief Unit test for RingQueue (MultithreadServer/ring_queue.h).
+ *
+ * Two tests:
+ *   1. test_single_thread_wrap(): a small queue is filled and partly
+ *      drained over and over with random block sizes, so the write position
+ *      wraps around the end of the buffer many times (exercising the Padding
+ *      blocks). Every popped block must be the oldest one pushed, with its
+ *      header and payload intact.
+ *   2. test_multi_thread(): 4 producers and 2 consumers hammer one queue
+ *      (like the workers and the network thread do with the send queue).
+ *      Each block carries the checksum of its payload in arg64, so a
+ *      corrupted or mixed up block is detected; the total checksum proves
+ *      that no block was lost or duplicated.
+ *
+ * Built by CMake (target ring_queue_test) and by tests/run_tests.sh, which
+ * can add a sanitizer (SANITIZE=thread or address). Exit code 0 = pass.
+ */
 #include <atomic>
 #include <cassert>
 #include <cstdio>
@@ -11,9 +28,13 @@
 #include "log_manager.h"
 #include "ring_queue.h"
 
+// ring_queue.cpp logs through LOG_* (log_manager.h), which needs this global.
+// It stays nullptr: logging is simply disabled in the test.
 LogManager* g_log_manager = nullptr;
 
-static int g_failures = 0;
+static int g_failures = 0; // number of failed CHECKs
+// Like assert(), but counts the failure and continues (and also works with
+// NDEBUG), so one run reports every problem.
 #define CHECK(cond)                                                                 \
     do {                                                                            \
         if (!(cond)) {                                                              \
@@ -22,13 +43,20 @@ static int g_failures = 0;
         }                                                                           \
     } while (0)
 
+/** Fill `v` with a deterministic byte pattern derived from `seed` (so payloads differ per block). */
 static void fill(std::vector<char>& v, uint32_t seed) {
     for (size_t i = 0; i < v.size(); ++i) {
         v[i] = static_cast<char>((seed * 131 + i * 7) & 0xff);
     }
 }
 
+/**
+ * FIFO order and data integrity across many wrap arounds, single threaded.
+ * `pending` is the reference model: it holds the payloads in push order.
+ */
 static void test_single_thread_wrap() {
+    // 16 KB with blocks of up to 3000 bytes (+ header): only a few blocks fit,
+    // so the buffer wraps around constantly
     RingQueue queue(16 * 1024);
     std::mt19937 gen(42);
     std::uniform_int_distribution<int> size_dist(0, 3000);
@@ -42,7 +70,7 @@ static void test_single_thread_wrap() {
             fill(data, pushed);
             QueueBlock block{};
             block.type = BlockType::ClientData;
-            block.arg = static_cast<int>(pushed);
+            block.arg = static_cast<int>(pushed); // sequence number, checked on pop
             if (!queue.try_push(block, data.data(), data.size())) {
                 break;
             }
@@ -68,6 +96,11 @@ static void test_single_thread_wrap() {
     printf("single thread: %u blocks pushed, %u popped\n", pushed, popped);
 }
 
+/**
+ * Concurrency: blocking push() with timeout (producers) and wait_and_pop()
+ * (consumers). Ordering across producers is not checked (it is not defined),
+ * only integrity and completeness.
+ */
 static void test_multi_thread() {
     RingQueue queue(64 * 1024);
     const int producers = 4;
@@ -90,12 +123,14 @@ static void test_multi_thread() {
                 block.type = BlockType::Send;
                 block.arg = p;
                 block.arg64 = static_cast<uint64_t>(sum);
+                // push() waits while the queue is full; retry after a timeout
                 while (!queue.push(block, data.data(), data.size(), std::chrono::milliseconds(100))) {
                 }
                 checksum_in += sum;
             }
         });
     }
+    // Consumers: pop until every block was consumed, verifying each checksum
     for (int c = 0; c < 2; ++c) {
         threads.emplace_back([&] {
             std::vector<char> out;
@@ -121,6 +156,7 @@ static void test_multi_thread() {
     printf("multi thread: %d blocks transferred\n", consumed.load());
 }
 
+/** Run both tests. @return 0 if no CHECK failed, 1 otherwise. */
 int main() {
     test_single_thread_wrap();
     test_multi_thread();

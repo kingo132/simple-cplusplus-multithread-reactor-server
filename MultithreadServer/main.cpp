@@ -1,3 +1,25 @@
+/**
+ * @file main.cpp
+ * @brief Entry point of mulserver: configuration, daemon mode, logging,
+ *        plugin loading, server start and the signal driven main loop.
+ *
+ * Usage: mulserver [config_file] [plugin.so]
+ *
+ * Start-up order (each step needs the previous ones):
+ *   1. load the configuration      (everything else is configured by it)
+ *   2. install signal handlers     (before any thread exists)
+ *   3. daemonize if run_mode = background (fork() must happen before
+ *      threads are created, and before files are opened by the logger)
+ *   4. create the logger           (from now on LOG_* works)
+ *   5. write the pid file          (after the fork: the daemon's pid)
+ *   6. load the plugin, run its handle_init(MAIN)
+ *   7. Server::start(): sockets, queues, network + worker threads
+ *   8. main thread sleeps until SIGINT / SIGTERM, reopens the log on SIGHUP
+ * Shutdown runs in reverse order.
+ *
+ * The main thread itself does no network work; see server.h for the
+ * network / worker thread design and docs/en/architecture.md for diagrams.
+ */
 #include <chrono>
 #include <cstring>
 #include <iostream>
@@ -11,6 +33,7 @@
 #include "server.h"
 #include "utility.h"
 
+// Definition of the global logger declared in log_manager.h (created below)
 LogManager* g_log_manager = nullptr;
 
 // Function to print usage instructions
@@ -23,6 +46,10 @@ static void print_usage(const char* prog) {
                  "                        or ./libhandler.so)\n";
 }
 
+/**
+ * @param argc / argv command line; also handed to every handle_init() call
+ * @return 0 after a clean shutdown, 1 if anything failed during start-up.
+ */
 int main(int argc, char** argv) {
     // Default file paths
     std::string config_file = "./config.ini";
@@ -42,12 +69,16 @@ int main(int argc, char** argv) {
     }
 
     // Load the configuration file
+    // No logger yet (its settings are in this file), so errors go to stderr.
+    // Relative paths in the config (bind_file, log_dir, dll_file) are relative
+    // to the current directory, not to the config file.
     ConfigurationManager& config = ConfigurationManager::getInstance();
     if (!config.load_configuration(config_file)) {
         std::cerr << "[" + Utility::get_current_timestamp_string() + "] Failed to load configuration from "
                   << Utility::getCwd() << ", " << config_file << std::endl;
         return 1;
     }
+    // The command line wins over the dll_file key
     if (dll_file.empty()) {
         dll_file = config.get_string("dll_file", DEFAULT_DLL_FILE);
     }
@@ -81,12 +112,15 @@ int main(int argc, char** argv) {
     }
 
     // Load the plugin
+    // dlopen + dlsym of every handle_* callback (see dll_functions.h)
     dll_func_t dll_functions;
     if (!load_dll_functions(&dll_functions, dll_file.c_str())) {
         LOG_ERR("Error loading plugin from %s", dll_file.c_str());
         return 1;
     }
 
+    // First plugin callback: global initialisation in the main thread (read
+    // config keys, allocate shared state). Non zero aborts the start.
     if (dll_functions.handle_init &&
         dll_functions.handle_init(argc, argv, static_cast<int>(ThreadType::MAIN)) != 0) {
         LOG_ERR("Main thread handle_init failed.");
@@ -96,12 +130,16 @@ int main(int argc, char** argv) {
     int exit_code = 0;
     {
         // Start the server
+        // Scoped, so the Server (and its threads) is destroyed before
+        // handle_fini(MAIN) and the logger below.
         Server server(&dll_functions);
         server.save_argc_argv(argc, argv);
         if (server.start(config.get_string("bind_file", DEFAULT_BIND_FILE)) != 0) {
             LOG_ERR("Server start failed! Current dir: %s", Utility::getCwd().c_str());
             exit_code = 1;
         } else {
+            // Main loop: just watch the flags set by the signal handlers. A
+            // 100 ms sleep is a simple, portable alternative to sigwait() etc.
             while (!stop_signal) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 if (reopen_log_signal) {
@@ -113,9 +151,11 @@ int main(int argc, char** argv) {
             LOG_NOTICE("Stop signal received, shutting down...");
         }
         // Stop the server
+        // Joins the network thread and the workers (each runs handle_fini)
         server.stop();
     }
 
+    // Last plugin callback, in the main thread, after all other threads ended
     if (dll_functions.handle_fini) {
         dll_functions.handle_fini(static_cast<int>(ThreadType::MAIN));
     }

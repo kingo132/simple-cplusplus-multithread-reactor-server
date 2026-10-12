@@ -3,6 +3,20 @@
 #   tests/run_tests.sh                 normal build
 #   SANITIZE=address tests/run_tests.sh
 #   SANITIZE=thread  tests/run_tests.sh
+#
+# Steps: build server, test plugin and client with the Makefiles (optionally
+# with a sanitizer), run the ring queue unit test, then start real servers on
+# localhost ports and drive them with tcp_test_client:
+#   - echo server with the epoll engine and again with the poll engine
+#     (TCP with several sizes / pipelining windows / connection counts, UDP)
+#   - relay server (epoll run only) forwarding every client to the echo server,
+#     which exercises srv_connect, half close and write-blocked flow control
+# Environment overrides: WORK_DIR (logs and configs, default a temp dir),
+# PORT_ECHO, PORT_RELAY, LOG_LEVEL, SANITIZE.
+# Exit code 0 = all tests passed.
+#
+# -e: stop on errors, -u: unset variables are errors, pipefail: a failing
+# command inside a pipe fails the pipe
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,12 +25,15 @@ mkdir -p "$WORK"
 SANITIZE="${SANITIZE:-}"
 PORT_ECHO=${PORT_ECHO:-22345}
 PORT_RELAY=${PORT_RELAY:-22346}
+# UDP port of the stub upstream used by tests/udp_empty_test.py
 PORT_UDP_UPSTREAM=${PORT_UDP_UPSTREAM:-22347}
+# Set to 1 by fail(); the tests continue so that all failures are reported
 FAILED=0
 
 log() { echo -e "\033[1;34m==> $*\033[0m"; }
 fail() { echo -e "\033[1;31mFAIL: $*\033[0m"; FAILED=1; }
 
+# Clean builds, so a change of SANITIZE never mixes instrumented and plain objects
 log "Building (SANITIZE=${SANITIZE:-none}) in $WORK"
 make -s -C "$ROOT/MultithreadServer" clean >/dev/null
 make -s -C "$ROOT/MultithreadServer" -j4 SANITIZE="$SANITIZE"
@@ -33,6 +50,9 @@ g++ -std=c++11 -O1 -g -pthread $SAN_FLAGS -DSRV_ENGINE_INTERNAL -I"$ROOT/Multith
 "$WORK/ring_queue_test" || fail "ring queue test"
 
 # start_server <name> <port> <mode> [engine]
+# Writes a bind file (TCP and UDP on the same port) and a config into
+# $WORK/<name>, starts mulserver in the background and waits up to 5 s for
+# "Server started" in its log. mode = echo | relay (the plugin's test_mode).
 start_server() {
     local name=$1 port=$2 mode=$3 engine=${4:-epoll}
     local dir="$WORK/$name"
@@ -62,6 +82,8 @@ CONF
     fail "$name did not start"; cat "$dir/stdout.txt"; return 1
 }
 
+# stop_server <name>: SIGINT (graceful shutdown), wait up to 10 s, SIGKILL if
+# it hangs, then scan its output for sanitizer reports.
 stop_server() {
     local dir="$WORK/$1"
     local pid; pid=$(cat "$dir/pid")
@@ -74,12 +96,16 @@ stop_server() {
     fi
 }
 
+# run_client <args>: run the test client, record a failure on a non zero exit code
 CLIENT="$ROOT/TestClient/tcp_test_client"
 run_client() {
     echo "  client $*"
     "$CLIENT" "$@" || fail "client $*"
 }
 
+# Every client run checks that each package comes back unchanged.
+# Client options: -c connections, -n packages each, -s max package size,
+# -w packages in flight (pipelining), -u UDP.
 for engine in epoll poll; do
     log "Echo server ($engine)"
     start_server "echo-$engine" "$PORT_ECHO" echo "$engine"
