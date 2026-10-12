@@ -1,3 +1,19 @@
+/**
+ * @file server.cpp
+ * @brief Server core: start/stop, the network (reactor) thread, the worker
+ *        threads and the thread safe plugin API (api_*).
+ *
+ * Reading guide
+ *   1. start()               - how everything is created
+ *   2. network_thread_func() - the reactor loop: wait -> handle events ->
+ *                              run worker commands -> flush deferred events -> timeouts
+ *   3. handle_event()        - what happens when a socket becomes ready
+ *   4. worker_thread_func()  - how plugin callbacks are invoked
+ *   5. api_send() / api_connect() - how a worker asks the network thread to act
+ *
+ * Golden rule: only the network thread touches sockets and the
+ * ConnectionManager. Everything else communicates through the queues.
+ */
 #include "server.h"
 
 #include <algorithm>
@@ -23,16 +39,23 @@
 #define MSG_NOSIGNAL 0
 #endif
 
+// The one running server. The exported srv_* functions (server_api.cpp)
+// have no "this", so they reach the server through this pointer.
 Server* g_server = nullptr;
 
 namespace {
 // Identity of the current thread, used by the srv_* API
+// thread_local: every thread has its own copy. A worker stores its index
+// here so srv_worker_id() and srv_connect() know which worker is calling.
 thread_local int t_worker_id = -1;
 thread_local bool t_is_network_thread = false;
 
 // Register flag: the connect() of an outbound TCP socket already completed
+// Bit added to the Register command's arg (the low 16 bits carry the
+// SRV_CONNECT_* flags), set when connect() succeeded immediately.
 constexpr int REGISTER_CONNECTED = 0x10000;
 
+/** @return a printable name of a block type, for log messages. */
 const char* block_type_name(BlockType type) {
     switch (type) {
     case BlockType::Padding: return "Padding";
@@ -56,11 +79,21 @@ const char* block_type_name(BlockType type) {
 }
 } // namespace
 
+/**
+ * Index of the calling worker thread, or -1 for the main / network thread.
+ * Defined here because t_worker_id is local to this file; used by
+ * srv_worker_id() in server_api.cpp.
+ */
 int srv_current_worker_id() {
     return t_worker_id;
 }
 
-// Parse the bind configuration file and set flags
+/**
+ * Read the bind file: one listening address per line,
+ *     ip  port  tcp|udp  [idle_timeout_seconds]
+ * '#' starts a comment line. Invalid lines are logged and skipped.
+ * @return the parsed entries (empty if the file cannot be opened).
+ */
 static std::vector<BindInfo> parse_bind_file(const std::string& bind_file_path) {
     std::vector<BindInfo> binds;
     std::ifstream bind_file(bind_file_path);
@@ -104,6 +137,7 @@ static std::vector<BindInfo> parse_bind_file(const std::string& bind_file_path) 
 }
 
 // Server constructor
+// Only initialises members; nothing is started before start().
 Server::Server(dll_func_t* dll_funcs)
     : stop_flag_(false), started_(false), dll_functions_(dll_funcs), next_conn_id_(1), round_robin_(0),
       wakeup_pending_(false), last_timeout_check_ms_(0), init_done_(0), init_failed_(0), saved_argc_(0),
@@ -112,6 +146,7 @@ Server::Server(dll_func_t* dll_funcs)
 }
 
 // Server destructor
+// Make sure no thread outlives the object it runs on.
 Server::~Server() {
     stop();
     for (int fd : wakeup_pipe_) {
@@ -124,6 +159,10 @@ Server::~Server() {
     }
 }
 
+/**
+ * Copy the configuration into options_. Values are read once at start;
+ * later edits of the config file need a restart.
+ */
 void Server::load_options() {
     ConfigurationManager& cm = ConfigurationManager::getInstance();
     options_.num_workers = std::max(1, cm.get_integer("worker_num", DEFAULT_WORKER_NUM));
@@ -146,13 +185,21 @@ void Server::load_options() {
     options_.event_engine = cm.get_string("event_engine", DEFAULT_EVENT_ENGINE);
 
     // Every queue must be able to hold a maximum sized package
+    // RingQueue::fits() only accepts blocks up to half of the buffer, so a
+    // queue must be at least twice the largest possible block.
     size_t min_queue = 2 * (static_cast<size_t>(options_.max_packet_size) + sizeof(QueueBlock)) + 4096;
     options_.recv_queue_size = std::max(options_.recv_queue_size, min_queue);
     options_.send_queue_size = std::max(options_.send_queue_size, min_queue);
     options_.send_buffer_max = std::max(options_.send_buffer_max, static_cast<size_t>(options_.max_packet_size));
 }
 
-// Start the server
+/**
+ * Start-up order matters:
+ *   options -> dispatcher -> wake-up pipe -> listening sockets -> queues
+ *   -> g_server -> threads -> wait for every handle_init().
+ * Sockets are bound before the threads start so that a bind error
+ * (port in use ...) fails fast without anything to clean up.
+ */
 int Server::start(const std::string& bind_file) {
     load_options();
     if (options_.max_packet_size <= 0 || options_.max_packet_size > (64 << 20)) {
@@ -160,7 +207,11 @@ int Server::start(const std::string& bind_file) {
         return -1;
     }
 
+    // epoll on Linux, poll elsewhere (or when event_engine = poll)
     dispatcher_.reset(EventDispatcher::create(options_.event_engine));
+    // Self-pipe trick: the network thread sleeps in epoll_wait()/poll(). A
+    // worker that queued a command writes one byte into wakeup_pipe_[1]; the
+    // read end is watched by the dispatcher, so the sleep ends immediately.
     if (pipe(wakeup_pipe_) != 0) {
         LOG_CRIT("Failed to create wakeup pipe: %s", strerror(errno));
         return -1;
@@ -182,6 +233,7 @@ int Server::start(const std::string& bind_file) {
     deferred_.resize(options_.num_workers);
     deferred_bytes_.assign(options_.num_workers, 0);
     throttled_.resize(options_.num_workers);
+    // From now on the srv_* functions work (handle_init may already call them).
     g_server = this;
 
     LOG_INFO("Server starting: %d workers, engine %s, max_packet_size %d, recv queue %zu, send queue %zu",
@@ -195,6 +247,7 @@ int Server::start(const std::string& bind_file) {
     }
 
     // Wait until every thread ran handle_init
+    // network thread + num_workers worker threads each call report_init() once.
     std::unique_lock<std::mutex> lock(init_mutex_);
     init_cv_.wait(lock, [this] { return init_done_ == options_.num_workers + 1; });
     if (init_failed_ > 0) {
@@ -207,6 +260,7 @@ int Server::start(const std::string& bind_file) {
     return 0;
 }
 
+/** Count one finished handle_init() and wake start(). */
 void Server::report_init(bool ok) {
     std::lock_guard<std::mutex> lock(init_mutex_);
     ++init_done_;
@@ -216,8 +270,13 @@ void Server::report_init(bool ok) {
     init_cv_.notify_all();
 }
 
-// Stop the server
+/**
+ * Shutdown order: stop the network thread first (it closes every socket
+ * without notifying the workers), then wake and join the workers, which
+ * run handle_fini() and exit.
+ */
 void Server::stop() {
+    // exchange() makes stop() idempotent: only the first call does the work.
     if (!started_.exchange(false)) {
         return;
     }
@@ -241,7 +300,12 @@ void Server::stop() {
     worker_threads_.clear();
 }
 
-// Create server sockets based on bind file
+/**
+ * For every bind entry: socket() -> non-blocking -> SO_REUSEADDR -> bind()
+ * -> listen() (TCP only) -> register as a "listening" Connection.
+ * UDP binds are not listened on: datagrams are read directly from the
+ * bound socket (see UdpHandler::accept_client).
+ */
 int Server::create_server_sockets(const std::string& bind_file) {
     binds_ = parse_bind_file(bind_file);
     if (binds_.empty()) {
@@ -269,6 +333,8 @@ int Server::create_server_sockets(const std::string& bind_file) {
         Utility::set_cloexec(socket_fd);
 
         int on = 1;
+        // SO_REUSEADDR: allow an immediate restart while old connections of the
+        // previous process are still in TIME_WAIT.
         setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
         if (addr.family == AF_INET6) {
             // "::" only listens on IPv6 so that "0.0.0.0" can be bound separately
@@ -289,6 +355,8 @@ int Server::create_server_sockets(const std::string& bind_file) {
             return -1;
         }
 
+        // Listening sockets are Connections too (flag CN_LISTEN_MASK), so the
+        // event loop treats every fd the same way.
         Connection* conn = connections_.add(socket_fd);
         conn->flags = bind_info.flags;
         conn->bind = &bind_info;
@@ -316,14 +384,18 @@ int Server::create_server_sockets(const std::string& bind_file) {
     return 0;
 }
 
+// Strategy pattern: TCP and UDP sockets need different I/O code.
 ProtocolHandler* Server::handler_for(const Connection* conn) const {
     return conn->is_udp() ? ProtocolHandler::get_udp_handler() : ProtocolHandler::get_tcp_handler();
 }
 
+// Spreads accepted TCP clients evenly over the workers.
 int Server::pick_worker_round_robin() {
     return static_cast<int>(round_robin_++ % static_cast<unsigned>(options_.num_workers));
 }
 
+// UDP has no connection object per peer, so the peer address decides the
+// worker. A stable hash keeps one peer's datagrams in order on one worker.
 int Server::pick_worker_for_addr(const NetAddr& addr) const {
     // FNV-1a over the address so the same peer always lands on the same worker
     uint32_t hash = 2166136261u;
@@ -339,6 +411,12 @@ int Server::pick_worker_for_addr(const NetAddr& addr) const {
 // Network thread
 // ---------------------------------------------------------------------------
 
+/**
+ * Interrupt the network thread's epoll_wait()/poll().
+ * wakeup_pending_ avoids writing a byte for every command: one unread byte
+ * already guarantees a wake-up; handle_event() clears the flag when it
+ * drains the pipe.
+ */
 void Server::wakeup_network() {
     if (wakeup_pipe_[1] >= 0 && !wakeup_pending_.exchange(true)) {
         char c = 1;
@@ -347,6 +425,11 @@ void Server::wakeup_network() {
     }
 }
 
+/**
+ * Add a new connection to the dispatcher. A connecting socket waits for
+ * "writable" (that is how a non-blocking connect() reports completion),
+ * every other socket waits for "readable".
+ */
 bool Server::watch(Connection* conn) {
     uint32_t events = EV_READ;
     if (conn->flags & CN_CONNECTING) {
@@ -357,6 +440,15 @@ bool Server::watch(Connection* conn) {
     return conn->registered;
 }
 
+/**
+ * The interest set is derived from the connection state, never set ad hoc:
+ *   - listening socket            -> READ (new clients / datagrams)
+ *   - connect in progress         -> WRITE (connect completion)
+ *   - otherwise READ unless paused / throttled / EOF / closing,
+ *     plus WRITE while there is unsent data in the send buffer.
+ * Waiting for WRITE only while needed is essential: an empty socket is
+ * almost always writable, so permanent WRITE interest would spin the loop.
+ */
 void Server::update_interest(Connection* conn) {
     uint32_t desired = 0;
     if (conn->is_listen()) {
@@ -392,6 +484,13 @@ void Server::update_interest(Connection* conn) {
     }
 }
 
+/**
+ * Hand an event to a worker without ever blocking the network thread.
+ * If the worker's queue is full the event goes to deferred_[worker]
+ * (unbounded, but reads stop via throttle() once it grows). Once anything
+ * is deferred, later events for that worker are deferred too, so the
+ * worker always sees events in the order they happened.
+ */
 void Server::deliver(int worker_id, BlockType type, const SocketInfo& si, const char* data, size_t len, int arg) {
     if (worker_id < 0 || worker_id >= options_.num_workers) {
         worker_id = 0;
@@ -419,6 +518,8 @@ void Server::deliver(int worker_id, BlockType type, const SocketInfo& si, const 
               deferred_bytes_[worker_id]);
 }
 
+// More than half a queue worth of events waiting outside the queue: stop
+// reading from every connection of this worker until it catches up.
 bool Server::worker_overloaded(int worker_id) const {
     if (worker_id < 0 || worker_id >= options_.num_workers) {
         return false;
@@ -426,6 +527,14 @@ bool Server::worker_overloaded(int worker_id) const {
     return deferred_bytes_[worker_id] > options_.recv_queue_size / 2;
 }
 
+/**
+ * Two levels of back pressure before reading a socket:
+ *   - any connection: pause when the worker is overloaded (see above)
+ *   - outbound connection: pause much earlier, as soon as the worker's
+ *     queue holds outbound_queue_limit bytes. Servers can send far faster
+ *     than clients; without this, small client messages (e.g. TCP ACKs
+ *     relayed by a proxy plugin) would wait behind megabytes of server data.
+ */
 bool Server::should_throttle(const Connection* conn) {
     int worker = conn->info.worker_id;
     if (worker < 0 || worker >= options_.num_workers) {
@@ -440,6 +549,7 @@ bool Server::should_throttle(const Connection* conn) {
     return false;
 }
 
+/** Stop reading `conn`; flush_deferred() resumes it once the worker caught up. */
 void Server::throttle(Connection* conn) {
     if (conn->flags & CN_THROTTLED) {
         return;
@@ -451,6 +561,12 @@ void Server::throttle(Connection* conn) {
     LOG_DEBUG("Worker %d overloaded, pause reading fd %d", worker, conn->info.sock_fd);
 }
 
+/**
+ * Called once per loop round: move deferred events into worker queues
+ * that have room again (in order), then resume throttled connections.
+ * Outbound connections only resume when the queue is below half of
+ * outbound_queue_limit (hysteresis, avoids pausing/resuming every round).
+ */
 void Server::flush_deferred() {
     for (int w = 0; w < options_.num_workers; ++w) {
         std::deque<DeferredBlock>& pending = deferred_[w];
@@ -487,11 +603,19 @@ void Server::flush_deferred() {
     }
 }
 
+// Outbound connections produce ServerData, accepted clients ClientData.
 void Server::dispatch_package(Connection* conn, const char* data, size_t len) {
     BlockType type = conn->is_outbound() ? BlockType::ServerData : BlockType::ClientData;
     deliver(conn->info.worker_id, type, conn->info, data, len);
 }
 
+/**
+ * The single place where sockets are closed. Exactly one "close" style
+ * event is delivered per connection:
+ *   - accepted client              -> ClientClose
+ *   - outbound, connect completed  -> ServerClose
+ *   - outbound, connect never done -> ServerOpen with an error
+ */
 void Server::close_connection(Connection* conn, int error, bool abort, bool notify) {
     int fd = conn->info.sock_fd;
     conn->info.last_error = error;
@@ -507,6 +631,8 @@ void Server::close_connection(Connection* conn, int error, bool abort, bool noti
     dispatcher_->remove_fd(fd);
     if (abort && conn->is_tcp() && !(conn->flags & CN_CONNECTING)) {
         // Discard unsent data and send RST
+        // SO_LINGER with timeout 0: close() discards unsent data and sends RST
+        // instead of the normal FIN handshake (used by srv_abort()).
         struct linger lg;
         lg.l_onoff = 1;
         lg.l_linger = 0;
@@ -527,9 +653,18 @@ void Server::close_connection(Connection* conn, int error, bool abort, bool noti
             deliver(conn->info.worker_id, BlockType::ClientClose, conn->info, nullptr, 0);
         }
     }
+    // Destroys the Connection; `conn` is dangling from here on.
     connections_.remove(fd);
 }
 
+/**
+ * Fast path: nothing queued yet -> try send() directly; usually the
+ * kernel takes everything and no copy into our buffer is needed.
+ * Slow path: append the rest to the send buffer and wait for EPOLLOUT.
+ * Limits: send_buffer_max (overflow -> drop or close, see
+ * send_overflow_policy) and the high watermark (-> WriteBlocked event so
+ * the plugin can slow down its producer).
+ */
 void Server::queue_stream_send(Connection* conn, const char* data, size_t len) {
     if (conn->flags & (CN_CLOSING | CN_WR_SHUT_DONE | CN_SHUTDOWN_WR)) {
         LOG_WARN("Drop %zu bytes for fd %d: connection is closing", len, conn->info.sock_fd);
@@ -538,6 +673,7 @@ void Server::queue_stream_send(Connection* conn, const char* data, size_t len) {
 
     size_t offset = 0;
     if (conn->send_buffer.empty() && !(conn->flags & CN_CONNECTING)) {
+        // MSG_NOSIGNAL: a closed peer gives EPIPE instead of killing us with SIGPIPE
         ssize_t n = send(conn->info.sock_fd, data, len, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -554,6 +690,8 @@ void Server::queue_stream_send(Connection* conn, const char* data, size_t len) {
     }
 
     if (conn->send_buffer.size() + (len - offset) > options_.send_buffer_max) {
+        // Dropping is only safe if no byte of this message was sent yet,
+        // otherwise the peer would see half a message.
         if (options_.drop_on_overflow && offset == 0) {
             LOG_WARN("Send buffer of fd %d full (%zu bytes), drop %zu bytes", conn->info.sock_fd,
                      conn->send_buffer.size(), len);
@@ -575,6 +713,7 @@ void Server::queue_stream_send(Connection* conn, const char* data, size_t len) {
     update_interest(conn);
 }
 
+/** Socket is writable: write buffered data until EAGAIN or empty. */
 void Server::flush_stream(Connection* conn) {
     while (!conn->send_buffer.empty()) {
         ssize_t n = send(conn->info.sock_fd, conn->send_buffer.data(), conn->send_buffer.size(), MSG_NOSIGNAL);
@@ -594,7 +733,12 @@ void Server::flush_stream(Connection* conn) {
     after_flush(conn);
 }
 
-// Handle pending close / shutdown / watermark once data was written
+/**
+ * Things that wait for an empty send buffer:
+ *   - srv_close()          -> close now
+ *   - srv_shutdown_write() -> shutdown(SHUT_WR), i.e. send our FIN
+ *   - WriteBlocked         -> report "drained" below the low watermark
+ */
 void Server::after_flush(Connection* conn) {
     if (conn->send_buffer.empty()) {
         if (conn->flags & CN_CLOSING) {
@@ -615,6 +759,13 @@ void Server::after_flush(Connection* conn) {
     update_interest(conn);
 }
 
+/**
+ * Dispatcher callback for one ready fd (network thread only):
+ *   - wake-up pipe        -> just drain it (commands run after the wait)
+ *   - listening socket    -> accept clients / read datagrams
+ *   - connecting socket   -> connect finished: success or error
+ *   - connected socket    -> read and/or write
+ */
 void Server::handle_event(int fd, uint32_t events) {
     if (fd == wakeup_pipe_[0]) {
         char buf[256];
@@ -630,6 +781,8 @@ void Server::handle_event(int fd, uint32_t events) {
         dispatcher_->remove_fd(fd);
         return;
     }
+    // Remember the id: receive_data() may close the connection, and the fd
+    // number may even be reused by a new connection during the same call.
     uint64_t conn_id = conn->info.conn_id;
     ProtocolHandler* handler = handler_for(conn);
 
@@ -642,6 +795,7 @@ void Server::handle_event(int fd, uint32_t events) {
         if (events & (EV_WRITE | EV_ERROR)) {
             int err = 0;
             socklen_t len = sizeof(err);
+            // A non-blocking connect() reports its result via SO_ERROR once writable
             if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0) {
                 err = errno;
             }
@@ -666,6 +820,7 @@ void Server::handle_event(int fd, uint32_t events) {
 
     if (events & (EV_READ | EV_ERROR)) {
         handler->receive_data(*this, conn);
+        // Still the same connection? (it may have been closed while reading)
         conn = connections_.get(fd, conn_id);
         if (conn == nullptr) {
             return;
@@ -676,6 +831,12 @@ void Server::handle_event(int fd, uint32_t events) {
     }
 }
 
+/**
+ * Execute a Register command from api_connect(): the worker created the
+ * socket and started the connect; from now on the network thread owns it.
+ * Datagram sockets and immediately connected TCP sockets are reported as
+ * open right away; the others wait for "writable" (see handle_event()).
+ */
 void Server::register_outbound(const QueueBlock& block) {
     const SocketInfo& si = block.socket_info;
     int fd = si.sock_fd;
@@ -720,6 +881,12 @@ void Server::register_outbound(const QueueBlock& block) {
     }
 }
 
+/**
+ * Execute one worker command. Commands carry (fd, conn_id); if the
+ * connection is gone or the fd now belongs to a newer connection, the
+ * command is silently dropped. This is what makes it safe for workers to
+ * act on connections that may close at any time.
+ */
 void Server::process_command(const QueueBlock& block, const char* data, size_t len) {
     const SocketInfo& si = block.socket_info;
 
@@ -737,6 +904,7 @@ void Server::process_command(const QueueBlock& block, const char* data, size_t l
 
     switch (block.type) {
     case BlockType::Send: {
+        // A reply to a UDP "client" goes out of the bind socket to the peer's address
         const NetAddr* to = (conn->is_listen() && conn->is_udp()) ? &si.remote_addr : nullptr;
         handler_for(conn)->send_data(*this, conn, data, len, to);
         break;
@@ -786,6 +954,7 @@ void Server::process_command(const QueueBlock& block, const char* data, size_t l
     }
 }
 
+/** Drain the command queue (bounded per round, see below). */
 void Server::process_commands() {
     static thread_local std::vector<char> data;
     QueueBlock block;
@@ -798,6 +967,12 @@ void Server::process_commands() {
     }
 }
 
+/**
+ * Runs about once per second. Linear scan over all connections, which is
+ * fine for tens of thousands of connections at this frequency.
+ *   - connecting longer than connect_timeout_ms -> ETIMEDOUT
+ *   - accepted client idle longer than the bind's idle timeout -> close
+ */
 void Server::check_timeouts() {
     int64_t now = Utility::now_ms();
     std::vector<int> fds;
@@ -823,6 +998,15 @@ void Server::check_timeouts() {
     }
 }
 
+/**
+ * The reactor loop. Every round:
+ *   1. wait for socket readiness (or a wake-up) and handle the events
+ *   2. execute the commands the workers queued
+ *   3. move deferred events into worker queues
+ *   4. check timeouts (once per second)
+ * With backlog (deferred events / throttled sockets) the wait is only
+ * 1 ms, so stalled work resumes quickly once a worker frees queue space.
+ */
 void Server::network_thread_func() {
     t_is_network_thread = true;
     LogManager::set_thread_name("conn");
@@ -891,6 +1075,11 @@ void Server::network_thread_func() {
 // Worker threads
 // ---------------------------------------------------------------------------
 
+/**
+ * Map one event to the matching plugin callback (worker thread).
+ * @param send_buffer per worker scratch buffer the plugin may write a
+ *        reply into (handle_client_open / handle_message_from_client).
+ */
 void Server::process_block(int /*worker_id*/, const QueueBlock& block, const std::vector<char>& data,
                            std::vector<char>& send_buffer) {
     const SocketInfo* si = &block.socket_info;
@@ -917,10 +1106,12 @@ void Server::process_block(int /*worker_id*/, const QueueBlock& block, const std
     case BlockType::ClientData: {
         char* send_data = send_buffer.data();
         int send_len = 0;
+        // The plugin may write into send_data or point it at its own memory
         int result = dll->handle_message_from_client(payload, payload_len, &send_data, &send_len, si);
         if (send_len > 0 && send_data != nullptr) {
             api_send(si, send_data, send_len);
         }
+        // <0 means "close"; meaningless for UDP clients (no connection to close)
         if (result < 0 && si->conn_kind == SRV_CONN_TCP_CLIENT) {
             LOG_DEBUG("handle_message_from_client returned %d, close fd %d", result, si->sock_fd);
             api_command(BlockType::Close, si, 0, 0);
@@ -964,6 +1155,12 @@ void Server::process_block(int /*worker_id*/, const QueueBlock& block, const std
     }
 }
 
+/**
+ * Worker loop: pop one event (waiting at most until the next timer tick),
+ * run its callback, then call handle_timer() when its interval elapsed.
+ * The plugin can change the interval by writing a different value into
+ * the handle_timer() argument.
+ */
 void Server::worker_thread_func(int worker_id) {
     t_worker_id = worker_id;
     LogManager::set_thread_name("work-" + std::to_string(worker_id));
@@ -1020,6 +1217,13 @@ void Server::worker_thread_func(int worker_id) {
 // Plugin API
 // ---------------------------------------------------------------------------
 
+/**
+ * Queue a command for the network thread. Workers wait (100 ms steps)
+ * while the queue is full - this is the back pressure that slows down a
+ * plugin producing more than the network can send. The network thread
+ * itself (e.g. a plugin calling srv_* from handle_input_from_client) must
+ * never wait for its own queue, so it only tries once.
+ */
 int Server::api_command(BlockType type, const SocketInfo* si, int arg, uint64_t arg64) {
     if (si == nullptr || !send_queue_) {
         return -1;
@@ -1046,6 +1250,11 @@ int Server::api_command(BlockType type, const SocketInfo* si, int arg, uint64_t 
     return 0;
 }
 
+/**
+ * Like api_command(Send) with a payload. Stream data larger than a
+ * quarter of the queue is split into chunks (TCP is a byte stream, so the
+ * split is invisible to the peer); a datagram cannot be split.
+ */
 int Server::api_send(const SocketInfo* si, const void* data, int len) {
     if (si == nullptr || data == nullptr || len <= 0 || !send_queue_) {
         return -1;
@@ -1086,6 +1295,14 @@ int Server::api_send(const SocketInfo* si, const void* data, int len) {
     return 0;
 }
 
+/**
+ * Create the socket and start connect() in the CALLING worker thread, so
+ * the caller immediately gets a complete SocketInfo (fd + conn_id) and
+ * can queue data before the connection is established. The Register
+ * command then hands the socket to the network thread. Because commands
+ * from one thread keep their order, the Register always arrives before
+ * any Send for the same socket.
+ */
 int Server::api_connect(int sock_type, int protocol, const NetAddr* remote, unsigned flags, uint64_t user_tag,
                         SocketInfo* out_si) {
     if (remote == nullptr || out_si == nullptr || (remote->family != AF_INET && remote->family != AF_INET6)) {
@@ -1113,6 +1330,8 @@ int Server::api_connect(int sock_type, int protocol, const NetAddr* remote, unsi
     }
 
     int register_arg = static_cast<int>(flags & 0xffff);
+    // Non-blocking connect: EINPROGRESS is the normal case for TCP. UDP and
+    // ICMP "connect" only sets the default peer and completes at once.
     if (connect(fd, reinterpret_cast<sockaddr*>(&ss), ss_len) == 0) {
         register_arg |= REGISTER_CONNECTED;
     } else if (errno != EINPROGRESS || sock_type != SOCK_STREAM) {

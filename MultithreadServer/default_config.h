@@ -1,3 +1,13 @@
+/**
+ * @file default_config.h
+ * @brief Default values for every configuration key the server reads.
+ *
+ * Each constant is used as the fallback of a ConfigurationManager getter
+ * (mostly in Server::load_options() and main.cpp); the key name is in the
+ * comment next to it. Some values are additionally clamped at start-up,
+ * e.g. queues are enlarged to hold at least two max sized packages and the
+ * send low watermark is always high watermark / 4 (see Server::load_options()).
+ */
 #ifndef DEFAULT_CONFIG_H
 #define DEFAULT_CONFIG_H
 
@@ -9,6 +19,7 @@ constexpr int DEFAULT_LOG_LEVEL = 6;                   // log_level: 0 emerg ...
 constexpr int DEFAULT_LOG_MAXFILES = 10;               // log_maxfiles: rotated files to keep
 constexpr long long DEFAULT_LOG_SIZE = 104857600;      // log_size: max size of one log file (100 MB)
 constexpr int DEFAULT_LOG_DEST = 3;                    // log_dest: 1 terminal, 2 file, 3 both
+// (log_prefix has no constant: it defaults to "", giving <log_dir>/server.log)
 
 // Server Configuration
 constexpr int DEFAULT_RINGQUEUE_LENGTH = 8 * 1024 * 1024;   // ringqueue_length: per worker receive queue (bytes)
@@ -17,6 +28,7 @@ constexpr int DEFAULT_WORKER_NUM = 4;                       // worker_num
 constexpr char DEFAULT_BIND_FILE[] = "./conf/bind.txt";     // bind_file
 constexpr char DEFAULT_DLL_FILE[] = "./libhandler.so";      // dll_file (overridden by the command line)
 constexpr int DEFAULT_MAX_CONNECTIONS = 100000;             // max_connections
+                                                            // (all Connections: listeners and outbound included)
 constexpr int DEFAULT_TIMER_INTERVAL_MS = 100;              // timer_interval_ms: handle_timer interval
 
 // Network Configuration
@@ -41,5 +53,6 @@ constexpr char DEFAULT_EVENT_ENGINE[] = "poll";
 // Daemon Configuration
 constexpr char DEFAULT_RUN_MODE[] = "foreground";      // run_mode: foreground | background
 constexpr char DEFAULT_PID_FILE[] = "";                // pid_file
+                                                       // (empty = do not write a pid file)
 
 #endif // DEFAULT_CONFIG_H
