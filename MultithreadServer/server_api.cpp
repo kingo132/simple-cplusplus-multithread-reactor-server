@@ -1,10 +1,12 @@
 // Implementation of the srv_* functions declared in server_api.h. They are
 // exported from the server executable (-rdynamic) so plugins can call them.
+#include <algorithm>
 #include <cerrno>
 #include <cstdarg>
 #include <cstring>
 
 #include "configuration_manager.h"
+#include "default_config.h"
 #include "log_manager.h"
 #include "server.h"
 #include "utility.h"
@@ -49,12 +51,20 @@ int srv_worker_id(void) {
     return srv_current_worker_id();
 }
 
+// Before the server started (e.g. in handle_init of the MAIN thread) these
+// come straight from the configuration
 int srv_worker_count(void) {
-    return g_server ? g_server->worker_count() : 0;
+    if (g_server != nullptr) {
+        return g_server->worker_count();
+    }
+    return std::max(1, ConfigurationManager::getInstance().get_integer("worker_num", DEFAULT_WORKER_NUM));
 }
 
 int srv_max_packet_size(void) {
-    return g_server ? g_server->max_packet_size() : 0;
+    if (g_server != nullptr) {
+        return g_server->max_packet_size();
+    }
+    return ConfigurationManager::getInstance().get_integer("max_packet_size", DEFAULT_MAX_PACKET_SIZE);
 }
 
 int srv_send(const SocketInfo* si, const void* data, int len) {
